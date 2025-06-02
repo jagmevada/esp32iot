@@ -1,4 +1,5 @@
 #include <WiFi.h>
+#include <HTTPClient.h>
 #include <OneWire.h>
 #include <DallasTemperature.h>
 
@@ -6,20 +7,22 @@
 const char *ssid = "Amba";
 const char *password = "dadaniruma";
 
-// DS18B20 data pin
-#define ONE_WIRE_BUS 23
+// Supabase Edge Function URL
+const char *serverURL = "https://uvyjejutvbozskwbvnmk.supabase.co/functions/v1/mqtt-handler";
 
+// Supabase Bearer Token
+const char *bearerToken = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InV2eWplanV0dmJvenNrd2J2bm1rIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NDg4NDY3NDEsImV4cCI6MjA2NDQyMjc0MX0.Xm1IItuH9UCzQx5-rgBt0NZf5HTPXh4kXApg_ma-XVw";
+
+// DS18B20 on GPIO 23
+#define ONE_WIRE_BUS 23
 OneWire oneWire(ONE_WIRE_BUS);
 DallasTemperature sensors(&oneWire);
-
-WiFiServer server(80);
 
 void setup()
 {
   Serial.begin(115200);
   sensors.begin();
 
-  // Connect to Wi-Fi
   WiFi.begin(ssid, password);
   Serial.print("Connecting to WiFi");
   while (WiFi.status() != WL_CONNECTED)
@@ -27,48 +30,55 @@ void setup()
     delay(500);
     Serial.print(".");
   }
-  Serial.println("\nConnected!");
-  Serial.print("IP Address: ");
-  Serial.println(WiFi.localIP());
-
-  server.begin(); // Start server
+  Serial.println("\n✅ Connected to WiFi");
 }
 
 void loop()
 {
-  WiFiClient client = server.available();
-  if (client)
+  sensors.requestTemperatures();
+  float temperature = sensors.getTempCByIndex(0);
+
+  if (WiFi.status() == WL_CONNECTED)
   {
-    Serial.println("Client connected");
+    HTTPClient http;
+    http.begin(serverURL);
+    http.addHeader("Content-Type", "application/json");
+    http.addHeader("Authorization", "Bearer " + String(bearerToken));
 
-    sensors.requestTemperatures();
-    float tempC = sensors.getTempCByIndex(0);
+    // Build JSON payload
+    String payload = "{";
+    payload += "\"device_id\":\"ESP32_001\",";
+    payload += "\"temperature\":" + String(temperature, 2) + ",";
+    payload += "\"humidity\":65.2,";
+    payload += "\"air_quality\":45,";
+    payload += "\"co2\":420,";
+    payload += "\"human_count\":2,";
+    payload += "\"light_level\":750,";
+    payload += "\"noise\":35.8";
+    payload += "}";
 
-    // Wait for client data
-    while (client.connected())
+    Serial.println("📤 Sending data:");
+    Serial.println(payload);
+
+    int httpResponseCode = http.POST(payload);
+
+    Serial.print("🌐 Response Code: ");
+    Serial.println(httpResponseCode);
+    if (httpResponseCode > 0)
     {
-      if (client.available())
-      {
-        client.read(); // Read request (we ignore the details)
-
-        // Send basic HTTP response
-        client.println("HTTP/1.1 200 OK");
-        client.println("Content-Type: text/html");
-        client.println("Connection: close");
-        client.println();
-
-        client.println("<!DOCTYPE HTML><html>");
-        client.println("<h1>ESP32 Temperature</h1>");
-        client.print("<p>Temperature: ");
-        client.print(tempC);
-        client.println(" &deg;C</p>");
-        client.println("</html>");
-
-        break;
-      }
+      Serial.println(http.getString()); // Server reply
     }
-    delay(10);
-    client.stop();
-    Serial.println("Client disconnected");
+    else
+    {
+      Serial.println("POST failed");
+    }
+
+    http.end();
   }
+  else
+  {
+    Serial.println("⚠️ WiFi not connected");
+  }
+
+  delay(5000); // Send every 5 seconds
 }
