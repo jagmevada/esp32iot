@@ -4,7 +4,7 @@
 #include <HTTPClient.h>
 #include <OneWire.h>
 #include <DallasTemperature.h>
-
+#define RANDM ((float)esp_random() / (float)UINT32_MAX)
 // Wi-Fi credentials
 const char *ssid = "S23";
 const char *password = "11223344";
@@ -105,8 +105,8 @@ void setup()
   configTime(0, 0, "pool.ntp.org", "time.nist.gov");
 }
 
-void sendSensorData(String id, float t1, float t2, float rh, float pm1, float pm25, float pm10,
-                    int nc05, int nc10, int nc25, bool relay1, bool relay2)
+void sendSensorData(String id, float t1, float t2, float rh, float pm1, float pm25, float pm10, float avg_p_size,
+                    int nc0_5, int n1_0, int nc2_5, int n10 , bool relay1, bool relay2)
 {
   if (WiFi.status() == WL_CONNECTED)
   {
@@ -130,12 +130,16 @@ void sendSensorData(String id, float t1, float t2, float rh, float pm1, float pm
       payload += "\"pm25\":" + String(pm25, 1) + ",";
     if (!isnan(pm10))
       payload += "\"pm10\":" + String(pm10, 1) + ",";
-    if (nc05 >= 0)
-      payload += "\"nc0_5\":" + String(nc05) + ",";
-    if (nc10 >= 0)
-      payload += "\"nc1_0\":" + String(nc10) + ",";
-    if (nc25 >= 0)
-      payload += "\"nc2_5\":" + String(nc25) + ",";
+    if (!isnan(avg_p_size))
+      payload += "\"avg_particle_size\":" + String(avg_p_size, 1) + ","; 
+    if (nc0_5 >= 0)
+      payload += "\"nc0_5\":" + String(nc0_5) + ",";
+    if (n1_0 >= 0)
+      payload += "\"nc1_0\":" + String(n1_0) + ",";
+    if (nc2_5 >= 0)
+      payload += "\"nc2_5\":" + String(nc2_5) + ",";
+      if (n10 >= 0) 
+      payload += "\"nc10\":" + String(n10) + ",";
     payload += "\"relay1\":" + String(relay1 ? "true" : "false");
 
     if (id.startsWith("ecs_"))
@@ -210,24 +214,27 @@ void loop()
   // Read Room1 - AC1
   sensorT1.requestTemperatures();
   float t1 = sensorT1.getTempCByIndex(0);
-  float t2 = t1 + 0.5; // Simulated t2
+  float t2 = t1 + 60 + RANDM;
 
-  sendSensorData("ac1_r1", t1, t2, NAN, NAN, NAN, NAN, -1, -1, -1, room1_AC1_Relay, NAN);
+  sendSensorData("ac1_r1", t1, t2, NAN, NAN, NAN, NAN, NAN, -1, -1, -1,-1, room1_AC1_Relay, NAN);
 
   // Simulated Room1 - AC2
-  sendSensorData("ac2_r1", 25.5, 25.8, NAN, NAN, NAN, NAN, -1, -1, -1, room1_AC2_Relay, NAN);
+  sendSensorData("ac2_r1", t1+ (RANDM), t2+(RANDM), NAN, NAN, NAN, NAN, NAN, -1, -1, -1, -1, room1_AC2_Relay, NAN);
 
-  // Simulated Room1 - ECS
-  sendSensorData("ecs_r1", 26.1, NAN, 55.5, 5.0, 10.2, 15.3, 400, 210, 100, room1_ECS_Relay1, room1_ECS_Relay2);
+// Simulated Room1 - ECS
+sendSensorData("ecs_r1", t1+(RANDM), t1+(RANDM), 55.5+(RANDM), 5.0+(RANDM), 10.2+(RANDM), 15.3+(RANDM), 2.0+(RANDM),  400+10*(RANDM), 210+10*(RANDM), 100+10*(RANDM), 50+10*(RANDM),
+               room1_ECS_Relay1, room1_ECS_Relay2); 
 
   // Simulated Room2 - AC1
-  sendSensorData("ac1_r2", t1 + 1.5, t2 + 1.5, NAN, NAN, NAN, NAN, -1, -1, -1, room2_AC1_Relay, NAN);
+  sendSensorData("ac1_r2", t1+(RANDM), t2+(RANDM), NAN, NAN, NAN, NAN, NAN,-1, -1, -1,-1, room2_AC1_Relay, NAN);
 
   // Simulated Room2 - AC2
-  sendSensorData("ac2_r2", 27.0, 27.5, NAN, NAN, NAN, NAN, -1, -1, -1, room2_AC2_Relay, NAN);
+  sendSensorData("ac2_r2", t1+(RANDM), t2+(RANDM), NAN, NAN, NAN, NAN,NAN, -1, -1, -1, -1, room2_AC2_Relay, NAN);
 
-  // Simulated Room2 - ECS
-  sendSensorData("ecs_r2", 27.6, NAN, 60.1, 15.0, 22.0, 30.5, 500, 260, 150, room2_ECS_Relay1, room2_ECS_Relay2);
+
+// Simulated Room2 - ECS
+sendSensorData("ecs_r2", t1+(RANDM), t1+(RANDM), 60.1+(RANDM), 15.0+(RANDM), 22.0+(RANDM), 30.5+(RANDM),2.0+(RANDM),  500+10*(RANDM), 260+10*(RANDM), 150+10*(RANDM), 75+10*(RANDM),
+               room2_ECS_Relay1, room2_ECS_Relay2);
 
   Serial.println("✅ All 6 devices posted.\n");
   delay(40000); // 40s interval
