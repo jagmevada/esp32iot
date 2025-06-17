@@ -1,241 +1,219 @@
-
+#include <WiFiManager.h>
 #include <WiFi.h>
 #include <time.h>
 #include <HTTPClient.h>
-#include <OneWire.h>
-#include <DallasTemperature.h>
-#define RANDM ((float)esp_random() / (float)UINT32_MAX)
-// Wi-Fi credentials
-const char *ssid = "S23";
-const char *password = "11223344";
+#include <EEPROM.h>
+#include <Wire.h>
+#include <Adafruit_SHT31.h>
 
-// Supabase REST endpoint
+// === EEPROM Setup ===
+#define EEPROM_SIZE 2
+#define EEPROM_RELAY1_ADDR 0
+#define EEPROM_RELAY2_ADDR 1
 
+// === Supabase API Info ===
 const char *getURL = "https://akxcjabakrvfaevdfwru.supabase.co/rest/v1/commands";
 const char *postURL = "https://akxcjabakrvfaevdfwru.supabase.co/rest/v1/sensor_data";
-const char *apikey = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImFreGNqYWJha3J2ZmFldmRmd3J1Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3NDkxMjMwMjUsImV4cCI6MjA2NDY5OTAyNX0.kykki4uVVgkSVU4lH-wcuGRdyu2xJ1CQkYFhQq_u08w";
+const char *apikey = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImFreGNqYWJha3J2ZmFldmRmd3J1Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3NDkxMjMwMjUsImV4cCI6MjA2NDY5OTAyNX0.kykki4uVVgkSVU4lH-wcuGRdyu2xJ1CQkYFhQq_u08w"; // truncated
 
-// GPIO Setup for Room1 - AC1
-#define ONE_WIRE_BUS_T1 23
-#define RELAY_PIN 32
+// === GPIO Definitions ===
+#define RELAY1_PIN 33 // Air Purifier
+#define RELAY2_PIN 32 // Dehumidifier
 
-OneWire oneWireT1(ONE_WIRE_BUS_T1);
-DallasTemperature sensorT1(&oneWireT1);
+// === I2C Buses ===
+TwoWire I2CBus1 = TwoWire(0); // GPIO 21/22
+TwoWire I2CBus2 = TwoWire(1); // GPIO 25/26
+Adafruit_SHT31 sht1;
+Adafruit_SHT31 sht2;
 
-// Short and readable sensor IDs
-const char *sensor_ids[] = {
-    "ac1_r1", "ac2_r1", "ecs_r1",
-    "ac1_r2", "ac2_r2", "ecs_r2"};
+bool relayState1 = false;
+bool relayState2 = true;
+unsigned long lastRelayCheck = 0;
+unsigned long lastSensorSend = 0;
+unsigned long lastWiFiCheck = 0;
+unsigned long lastEEPROMWrite = 0;
 
-// Function to fetch relay state from Supabase for a given sensor and target
-bool fetchRelayCommand(const char *sensor_id, const char *target, bool currentState)
-{
+bool fetchRelayCommand(const char *sensor_id, const char *target, bool currentState) {
   HTTPClient http;
   String url = String(getURL) + "?sensor_id=eq." + sensor_id + "&target=eq." + target + "&order=issued_at.desc&limit=1";
-
   http.begin(url);
   http.addHeader("apikey", apikey);
   http.addHeader("Authorization", "Bearer " + String(apikey));
-
   int httpCode = http.GET();
-  if (httpCode == 200)
-  {
+  if (httpCode == 200) {
     String response = http.getString();
-    Serial.println("📥 Command Response: " + response);
-
-    if (response.indexOf("\"state\":") != -1 && response.indexOf("\"issued_at\":") != -1)
-    {
-      int tsStart = response.indexOf("\"issued_at\":\"") + 13;
-      int tsEnd = response.indexOf("\"", tsStart);
+    int tsStart = response.indexOf("\"issued_at\":\"") + 13;
+    int tsEnd = response.indexOf("\"", tsStart);
+    if (tsStart > 12 && tsEnd > tsStart) {
       String timestampStr = response.substring(tsStart, tsEnd);
-      Serial.println("⏱ Timestamp: " + timestampStr);
-
       struct tm tm;
       if (sscanf(timestampStr.c_str(), "%4d-%2d-%2dT%2d:%2d:%2d",
                  &tm.tm_year, &tm.tm_mon, &tm.tm_mday,
-                 &tm.tm_hour, &tm.tm_min, &tm.tm_sec) == 6)
-      {
-
+                 &tm.tm_hour, &tm.tm_min, &tm.tm_sec) == 6) {
         tm.tm_year -= 1900;
         tm.tm_mon -= 1;
         time_t issuedEpoch = mktime(&tm);
         time_t nowEpoch = time(nullptr);
-        double ageSeconds = difftime(nowEpoch, issuedEpoch);
-
-        if (ageSeconds > 120)
-        {
-          Serial.println("⏳ Command too old, retaining previous state.");
-          return currentState; // RETAIN OLD STATE
-        }
-
-        // Parse new state
-        if (response.indexOf("\"state\":true") != -1)
-          return true;
-        if (response.indexOf("\"state\":false") != -1)
-          return false;
+        if (difftime(nowEpoch, issuedEpoch) > 120) return currentState;
+        if (response.indexOf("\"state\":true") != -1) return true;
+        if (response.indexOf("\"state\":false") != -1) return false;
       }
     }
   }
-  else
-  {
-    Serial.println("❌ GET command failed, code: " + String(httpCode));
-  }
-
   http.end();
-  return currentState; // RETAIN OLD STATE ON FAILURE
+  return currentState;
 }
 
-void setup()
-{
+void sendSensorData(String id, float t1, float t2, float rh, bool r1, bool r2) {
+  if (WiFi.status() != WL_CONNECTED) return;
+  HTTPClient http;
+  http.begin(postURL);
+  http.addHeader("Content-Type", "application/json");
+  http.addHeader("apikey", apikey);
+  http.addHeader("Authorization", "Bearer " + String(apikey));
+
+  String payload = "{";
+  payload += "\"sensor_id\":\"" + id + "\",";
+  payload += "\"t1\":" + String(t1, 2) + ",";
+  payload += "\"t2\":" + String(t2, 2) + ",";
+  payload += "\"rh\":" + String(rh, 2) + ",";
+  payload += "\"relay1\":" + String(r1 ? "true" : "false") + ",";
+  payload += "\"relay2\":" + String(r2 ? "true" : "false");
+  payload += "}";
+
+  Serial.println("📤 POST: " + payload);
+  int code = http.POST(payload);
+  if (code > 0) Serial.println("✅ Supabase: " + http.getString());
+  else Serial.println("❌ POST failed");
+  http.end();
+}
+
+bool readSensors(float &t1, float &t2, float &rhAvg) {
+  Wire = I2CBus1;
+  t1 = sht1.readTemperature();
+  float rh1 = sht1.readHumidity();
+  Wire = I2CBus2;
+  t2 = sht2.readTemperature();
+  float rh2 = sht2.readHumidity();
+  bool v1 = (t1 != NAN && rh1 != NAN);
+  bool v2 = (t2 != NAN && rh2 != NAN);
+  if (!v1 || !v2) return false;
+  rhAvg = (rh1 + rh2) / 2.0;
+  return true;
+}
+
+void checkWiFi() {
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("⚠️ WiFi disconnected! Reconnecting...");
+    WiFi.disconnect();
+    WiFi.begin();
+    unsigned long start = millis();
+    while (WiFi.status() != WL_CONNECTED && millis() - start < 10000) {
+      delay(500);
+      Serial.print(".");
+    }
+    if (WiFi.status() != WL_CONNECTED) {
+      Serial.println("\n❌ WiFi reconnect failed. Launching portal...");
+      WiFiManager wm;
+      wm.setConfigPortalTimeout(120);
+      if (!wm.autoConnect("ECS_R2_SETUP")) {
+        Serial.println("⏳ Portal timeout. Restarting...");
+        ESP.restart();
+      }
+    } else {
+      Serial.println("✅ Reconnected to WiFi");
+    }
+  }
+}
+
+void setup() {
+  EEPROM.begin(EEPROM_SIZE);
+  delay(5);
   Serial.begin(115200);
 
-  pinMode(RELAY_PIN, OUTPUT);
-  digitalWrite(RELAY_PIN, LOW); // OFF initially
+  pinMode(RELAY1_PIN, OUTPUT);
+  pinMode(RELAY2_PIN, OUTPUT);
+  relayState1 = EEPROM.read(EEPROM_RELAY1_ADDR) == 1;
+  relayState2 = EEPROM.read(EEPROM_RELAY2_ADDR) == 1;
+  digitalWrite(RELAY1_PIN, relayState1 ? LOW : HIGH);
+  digitalWrite(RELAY2_PIN, relayState2 ? LOW : HIGH);
 
-  sensorT1.begin();
+  I2CBus1.begin(21, 22);
+  I2CBus2.begin(25, 26);
 
-  WiFi.begin(ssid, password);
-  Serial.print("Connecting to WiFi");
-  while (WiFi.status() != WL_CONNECTED)
-  {
-    delay(500);
-    Serial.print(".");
+  Wire = I2CBus1;
+  sht1.begin(0x44);
+  Wire = I2CBus2;
+  sht2.begin(0x44);
+
+  WiFiManager wm;
+  wm.setConfigPortalTimeout(120);
+  wm.setWiFiAutoReconnect(true);
+  if (!wm.autoConnect("ECS_R2_SETUP")) {
+    Serial.println("❌ WiFiManager failed. Restarting...");
+    ESP.restart();
   }
-  Serial.println("\n✅ Connected to WiFi");
+
   configTime(0, 0, "pool.ntp.org", "time.nist.gov");
+  delay(1000);
+
+  relayState1 = fetchRelayCommand("ecs_r2", "relay1", relayState1);
+  relayState2 = fetchRelayCommand("ecs_r2", "relay2", relayState2);
+  digitalWrite(RELAY1_PIN, relayState1 ? LOW : HIGH);
+  digitalWrite(RELAY2_PIN, relayState2 ? LOW : HIGH);
+
+  lastRelayCheck = lastSensorSend = lastWiFiCheck = lastEEPROMWrite = millis();
 }
 
-void sendSensorData(String id, float t1, float t2, float rh, float pm1, float pm25, float pm10, float avg_p_size,
-                    int nc0_5, int n1_0, int nc2_5, int n10 , bool relay1, bool relay2)
-{
-  if (WiFi.status() == WL_CONNECTED)
-  {
-    HTTPClient http;
-    http.begin(postURL);
-    http.addHeader("Content-Type", "application/json");
-    http.addHeader("apikey", apikey);
-    http.addHeader("Authorization", "Bearer " + String(apikey));
+void loop() {
+  unsigned long now = millis();
 
-    String payload = "{";
-    payload += "\"sensor_id\":\"" + id + "\",";
-    if (!isnan(t1))
-      payload += "\"t1\":" + String(t1, 2) + ",";
-    if (!isnan(t2))
-      payload += "\"t2\":" + String(t2, 2) + ",";
-    if (!isnan(rh))
-      payload += "\"rh\":" + String(rh, 1) + ",";
-    if (!isnan(pm1))
-      payload += "\"pm1\":" + String(pm1, 1) + ",";
-    if (!isnan(pm25))
-      payload += "\"pm25\":" + String(pm25, 1) + ",";
-    if (!isnan(pm10))
-      payload += "\"pm10\":" + String(pm10, 1) + ",";
-    if (!isnan(avg_p_size))
-      payload += "\"avg_particle_size\":" + String(avg_p_size, 1) + ","; 
-    if (nc0_5 >= 0)
-      payload += "\"nc0_5\":" + String(nc0_5) + ",";
-    if (n1_0 >= 0)
-      payload += "\"nc1_0\":" + String(n1_0) + ",";
-    if (nc2_5 >= 0)
-      payload += "\"nc2_5\":" + String(nc2_5) + ",";
-      if (n10 >= 0) 
-      payload += "\"nc10\":" + String(n10) + ",";
-    payload += "\"relay1\":" + String(relay1 ? "true" : "false");
-
-    if (id.startsWith("ecs_"))
-    {
-      payload += ",\"relay2\":" + String(relay2 ? "true" : "false");
-    }
-    payload += "}";
-
-    Serial.println("📤 POST to Supabase: " + payload);
-
-    int code = http.POST(payload);
-    if (code > 0)
-    {
-      Serial.print("✅ Response: ");
-      Serial.println(http.getString());
-    }
-    else
-    {
-      Serial.println("❌ POST failed");
-    }
-
-    http.end();
+  if (now - lastWiFiCheck > 10000) {
+    lastWiFiCheck = now;
+    checkWiFi();
   }
-  else
-  {
-    Serial.println("⚠️ WiFi disconnected");
+
+  if (now - lastRelayCheck >= 5000) {
+    lastRelayCheck = now;
+    bool newR1 = fetchRelayCommand("ecs_r2", "relay1", relayState1);
+    bool newR2 = fetchRelayCommand("ecs_r2", "relay2", relayState2);
+    if (newR1 != relayState1 || newR2 != relayState2) {
+      relayState1 = newR1;
+      relayState2 = newR2;
+      digitalWrite(RELAY1_PIN, relayState1 ? LOW : HIGH);
+      digitalWrite(RELAY2_PIN, relayState2 ? LOW : HIGH);
+      Serial.printf("🔄 Relays changed: R1=%s, R2=%s\n", relayState1 ? "ON" : "OFF", relayState2 ? "ON" : "OFF");
+
+      float t1, t2, rh;
+      if (readSensors(t1, t2, rh)) {
+        sendSensorData("ecs_r2", t1, t2, rh, relayState1, relayState2);
+        lastSensorSend = now;
+      }
+    }
   }
-}
 
-void loop()
-{
-  // Fetch latest relay1 state for ac1_r1
-  // static bool lastRelay1State = false;
-  // bool relayState1 = fetchRelayCommand("ac1_r1", "relay1", lastRelay1State);
-  // lastRelay1State = relayState1;
-  // digitalWrite(RELAY_PIN, relayState1 ? HIGH : LOW);
+  if (now - lastSensorSend >= 40000) {
+    float t1, t2, rh;
+    if (readSensors(t1, t2, rh)) {
+      Serial.println("📊 Periodic sensor update.");
+      sendSensorData("ecs_r2", t1, t2, rh, relayState1, relayState2);
+    } else {
+      Serial.println("⚠️ Invalid sensor values.");
+    }
+    lastSensorSend = now;
+  }
 
-  // ==== ROOM 1 ====
-  static bool lastRoom1_AC1_Relay = false;
-  bool room1_AC1_Relay = fetchRelayCommand("ac1_r1", "relay1", lastRoom1_AC1_Relay);
-  lastRoom1_AC1_Relay = room1_AC1_Relay;
+  if (now - lastEEPROMWrite >= 10000) {
+    lastEEPROMWrite = now;
+    if (EEPROM.read(EEPROM_RELAY1_ADDR) != (relayState1 ? 1 : 0)) {
+      EEPROM.write(EEPROM_RELAY1_ADDR, relayState1 ? 1 : 0);
+    }
+    if (EEPROM.read(EEPROM_RELAY2_ADDR) != (relayState2 ? 1 : 0)) {
+      EEPROM.write(EEPROM_RELAY2_ADDR, relayState2 ? 1 : 0);
+    }
+    EEPROM.commit();
+    Serial.println("💾 Relay states saved to EEPROM.");
+  }
 
-  static bool lastRoom1_AC2_Relay = false;
-  bool room1_AC2_Relay = fetchRelayCommand("ac2_r1", "relay1", lastRoom1_AC2_Relay);
-  lastRoom1_AC2_Relay = room1_AC2_Relay;
-
-  static bool lastRoom1_ECS_Relay1 = false;
-  bool room1_ECS_Relay1 = fetchRelayCommand("ecs_r1", "relay1", lastRoom1_ECS_Relay1);
-  lastRoom1_ECS_Relay1 = room1_ECS_Relay1;
-
-  static bool lastRoom1_ECS_Relay2 = false;
-  bool room1_ECS_Relay2 = fetchRelayCommand("ecs_r1", "relay2", lastRoom1_ECS_Relay2);
-  lastRoom1_ECS_Relay2 = room1_ECS_Relay2;
-
-  // ==== ROOM 2 ====
-  static bool lastRoom2_AC1_Relay = false;
-  bool room2_AC1_Relay = fetchRelayCommand("ac1_r2", "relay1", lastRoom2_AC1_Relay);
-  lastRoom2_AC1_Relay = room2_AC1_Relay;
-
-  static bool lastRoom2_AC2_Relay = false;
-  bool room2_AC2_Relay = fetchRelayCommand("ac2_r2", "relay1", lastRoom2_AC2_Relay);
-  lastRoom2_AC2_Relay = room2_AC2_Relay;
-
-  static bool lastRoom2_ECS_Relay1 = false;
-  bool room2_ECS_Relay1 = fetchRelayCommand("ecs_r2", "relay1", lastRoom2_ECS_Relay1);
-  lastRoom2_ECS_Relay1 = room2_ECS_Relay1;
-
-  static bool lastRoom2_ECS_Relay2 = false;
-  bool room2_ECS_Relay2 = fetchRelayCommand("ecs_r2", "relay2", lastRoom2_ECS_Relay2);
-  lastRoom2_ECS_Relay2 = room2_ECS_Relay2;
-
-  // Read Room1 - AC1
-  sensorT1.requestTemperatures();
-  float t1 = sensorT1.getTempCByIndex(0);
-  float t2 = t1 + 60 + RANDM;
-
-  sendSensorData("ac1_r1", t1, t2, NAN, NAN, NAN, NAN, NAN, -1, -1, -1,-1, room1_AC1_Relay, NAN);
-
-  // Simulated Room1 - AC2
-  sendSensorData("ac2_r1", t1+ (RANDM), t2+(RANDM), NAN, NAN, NAN, NAN, NAN, -1, -1, -1, -1, room1_AC2_Relay, NAN);
-
-// Simulated Room1 - ECS
-sendSensorData("ecs_r1", t1+(RANDM), t1+(RANDM), 55.5+(RANDM), 5.0+(RANDM), 10.2+(RANDM), 15.3+(RANDM), 2.0+(RANDM),  400+10*(RANDM), 210+10*(RANDM), 100+10*(RANDM), 50+10*(RANDM),
-               room1_ECS_Relay1, room1_ECS_Relay2); 
-
-  // Simulated Room2 - AC1
-  sendSensorData("ac1_r2", t1+(RANDM), t2+(RANDM), NAN, NAN, NAN, NAN, NAN,-1, -1, -1,-1, room2_AC1_Relay, NAN);
-
-  // Simulated Room2 - AC2
-  sendSensorData("ac2_r2", t1+(RANDM), t2+(RANDM), NAN, NAN, NAN, NAN,NAN, -1, -1, -1, -1, room2_AC2_Relay, NAN);
-
-
-// Simulated Room2 - ECS
-sendSensorData("ecs_r2", t1+(RANDM), t1+(RANDM), 60.1+(RANDM), 15.0+(RANDM), 22.0+(RANDM), 30.5+(RANDM),2.0+(RANDM),  500+10*(RANDM), 260+10*(RANDM), 150+10*(RANDM), 75+10*(RANDM),
-               room2_ECS_Relay1, room2_ECS_Relay2);
-
-  Serial.println("✅ All 6 devices posted.\n");
-  delay(40000); // 40s interval
+  delay(10);
 }
