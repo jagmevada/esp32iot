@@ -17,8 +17,8 @@ const char *postURL = "https://akxcjabakrvfaevdfwru.supabase.co/rest/v1/sensor_d
 const char *apikey = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImFreGNqYWJha3J2ZmFldmRmd3J1Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3NDkxMjMwMjUsImV4cCI6MjA2NDY5OTAyNX0.kykki4uVVgkSVU4lH-wcuGRdyu2xJ1CQkYFhQq_u08w"; // truncated
 
 // === GPIO Definitions ===
-#define RELAY1_PIN 33 // Air Purifier
-#define RELAY2_PIN 32 // Dehumidifier
+#define RELAY1_PIN 32 // Air Purifier
+#define RELAY2_PIN 33 // Dehumidifier
 
 // === I2C Buses ===
 TwoWire I2CBus1 = TwoWire(0); // GPIO 21/22
@@ -64,8 +64,9 @@ bool fetchRelayCommand(const char *sensor_id, const char *target, bool currentSt
   return currentState;
 }
 
-void sendSensorData(String id, float t1, float t2, float rh, bool r1, bool r2) {
+void sendSensorData(String id, float t1, float t2, float rh1, float rh2, bool v1, bool v2, bool r1, bool r2) {
   if (WiFi.status() != WL_CONNECTED) return;
+
   HTTPClient http;
   http.begin(postURL);
   http.addHeader("Content-Type", "application/json");
@@ -74,9 +75,16 @@ void sendSensorData(String id, float t1, float t2, float rh, bool r1, bool r2) {
 
   String payload = "{";
   payload += "\"sensor_id\":\"" + id + "\",";
-  payload += "\"t1\":" + String(t1, 2) + ",";
-  payload += "\"t2\":" + String(t2, 2) + ",";
-  payload += "\"rh\":" + String(rh, 2) + ",";
+  payload += "\"t1\":" + (v1 ? String(t1, 2) : "null") + ",";
+  payload += "\"t2\":" + (v2 ? String(t2, 2) : "null") + ",";
+  if (v1 && v2)
+    payload += "\"rh\":" + String((rh1 + rh2) / 2.0, 2) + ",";
+  else if (v1)
+    payload += "\"rh\":" + String(rh1, 2) + ",";
+  else if (v2)
+    payload += "\"rh\":" + String(rh2, 2) + ",";
+  else
+    payload += "\"rh\":null,";
   payload += "\"relay1\":" + String(r1 ? "true" : "false") + ",";
   payload += "\"relay2\":" + String(r2 ? "true" : "false");
   payload += "}";
@@ -85,22 +93,25 @@ void sendSensorData(String id, float t1, float t2, float rh, bool r1, bool r2) {
   int code = http.POST(payload);
   if (code > 0) Serial.println("✅ Supabase: " + http.getString());
   else Serial.println("❌ POST failed");
+
   http.end();
 }
 
-bool readSensors(float &t1, float &t2, float &rhAvg) {
+
+bool readSensors(float &t1, float &t2, float &rh1, float &rh2, bool &v1, bool &v2) {
   Wire = I2CBus1;
   t1 = sht1.readTemperature();
-  float rh1 = sht1.readHumidity();
+  rh1 = sht1.readHumidity();
   Wire = I2CBus2;
   t2 = sht2.readTemperature();
-  float rh2 = sht2.readHumidity();
-  bool v1 = (t1 != NAN && rh1 != NAN);
-  bool v2 = (t2 != NAN && rh2 != NAN);
-  if (!v1 || !v2) return false;
-  rhAvg = (rh1 + rh2) / 2.0;
-  return true;
+  rh2 = sht2.readHumidity();
+
+  v1 = !isnan(t1) && !isnan(rh1);
+  v2 = !isnan(t2) && !isnan(rh2);
+
+  return v1 || v2;
 }
+
 
 void checkWiFi() {
   if (WiFi.status() != WL_CONNECTED) {
@@ -116,7 +127,7 @@ void checkWiFi() {
       Serial.println("\n❌ WiFi reconnect failed. Launching portal...");
       WiFiManager wm;
       wm.setConfigPortalTimeout(120);
-      if (!wm.autoConnect("ECS_R2_SETUP")) {
+      if (!wm.autoConnect("ECS_R1_SETUP")) {
         Serial.println("⏳ Portal timeout. Restarting...");
         ESP.restart();
       }
@@ -149,7 +160,7 @@ void setup() {
   WiFiManager wm;
   wm.setConfigPortalTimeout(120);
   wm.setWiFiAutoReconnect(true);
-  if (!wm.autoConnect("ECS_R2_SETUP")) {
+  if (!wm.autoConnect("ECS_R1_SETUP")) {
     Serial.println("❌ WiFiManager failed. Restarting...");
     ESP.restart();
   }
@@ -157,8 +168,8 @@ void setup() {
   configTime(0, 0, "pool.ntp.org", "time.nist.gov");
   delay(1000);
 
-  relayState1 = fetchRelayCommand("ecs_r2", "relay1", relayState1);
-  relayState2 = fetchRelayCommand("ecs_r2", "relay2", relayState2);
+  relayState1 = fetchRelayCommand("ecs_r1", "relay1", relayState1);
+  relayState2 = fetchRelayCommand("ecs_r1", "relay2", relayState2);
   digitalWrite(RELAY1_PIN, relayState1 ? LOW : HIGH);
   digitalWrite(RELAY2_PIN, relayState2 ? LOW : HIGH);
 
@@ -175,8 +186,8 @@ void loop() {
 
   if (now - lastRelayCheck >= 5000) {
     lastRelayCheck = now;
-    bool newR1 = fetchRelayCommand("ecs_r2", "relay1", relayState1);
-    bool newR2 = fetchRelayCommand("ecs_r2", "relay2", relayState2);
+    bool newR1 = fetchRelayCommand("ecs_r1", "relay1", relayState1);
+    bool newR2 = fetchRelayCommand("ecs_r1", "relay2", relayState2);
     if (newR1 != relayState1 || newR2 != relayState2) {
       relayState1 = newR1;
       relayState2 = newR2;
@@ -184,36 +195,50 @@ void loop() {
       digitalWrite(RELAY2_PIN, relayState2 ? LOW : HIGH);
       Serial.printf("🔄 Relays changed: R1=%s, R2=%s\n", relayState1 ? "ON" : "OFF", relayState2 ? "ON" : "OFF");
 
-      float t1, t2, rh;
-      if (readSensors(t1, t2, rh)) {
-        sendSensorData("ecs_r2", t1, t2, rh, relayState1, relayState2);
-        lastSensorSend = now;
-      }
+float t1, t2, rh1, rh2;
+bool v1, v2;
+if (readSensors(t1, t2, rh1, rh2, v1, v2)) {
+  sendSensorData("ecs_r1", t1, t2, rh1, rh2, v1, v2, relayState1, relayState2);
+} else {
+  Serial.println("⚠️ No valid sensors — sending relay states only.");
+  sendSensorData("ecs_r1", 0, 0, 0, 0, false, false, relayState1, relayState2);
+}
     }
   }
 
   if (now - lastSensorSend >= 40000) {
-    float t1, t2, rh;
-    if (readSensors(t1, t2, rh)) {
-      Serial.println("📊 Periodic sensor update.");
-      sendSensorData("ecs_r2", t1, t2, rh, relayState1, relayState2);
-    } else {
-      Serial.println("⚠️ Invalid sensor values.");
-    }
+float t1, t2, rh1, rh2;
+bool v1, v2;
+if (readSensors(t1, t2, rh1, rh2, v1, v2)) {
+  sendSensorData("ecs_r1", t1, t2, rh1, rh2, v1, v2, relayState1, relayState2);
+} else {
+  Serial.println("⚠️ No valid sensors — sending relay states only.");
+  sendSensorData("ecs_r1", 0, 0, 0, 0, false, false, relayState1, relayState2);
+}
     lastSensorSend = now;
   }
 
   if (now - lastEEPROMWrite >= 10000) {
     lastEEPROMWrite = now;
+
+    bool changed = false;
+
     if (EEPROM.read(EEPROM_RELAY1_ADDR) != (relayState1 ? 1 : 0)) {
       EEPROM.write(EEPROM_RELAY1_ADDR, relayState1 ? 1 : 0);
+      changed = true;
     }
+
     if (EEPROM.read(EEPROM_RELAY2_ADDR) != (relayState2 ? 1 : 0)) {
       EEPROM.write(EEPROM_RELAY2_ADDR, relayState2 ? 1 : 0);
+      changed = true;
     }
-    EEPROM.commit();
-    Serial.println("💾 Relay states saved to EEPROM.");
+
+    if (changed) {
+      EEPROM.commit();
+      Serial.println("💾 Relay states saved to EEPROM.");
+    }
   }
+
 
   delay(10);
 }
