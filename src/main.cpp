@@ -712,6 +712,39 @@ static void fetchSchedulesFromSupabase() {
   }
 }
 
+// Print the in-memory schedule table with detailed info
+static void printScheduleTableFromMemory() {
+  Serial.println("\n📋 === SCHEDULE TABLE (IN-MEMORY) ===");
+  Serial.printf("Total schedules loaded: %d\n", scheduleCount);
+  
+  if (scheduleCount == 0) {
+    Serial.println("(empty)");
+    Serial.println("📋 === END ===\n");
+    return;
+  }
+  
+  for (int i = 0; i < scheduleCount; ++i) {
+    ScheduleRow &r = scheduleRows[i];
+    Serial.printf("\n[%d] ID=%ld, Enable=%d, Type=%s\n", i, r.row_id, r.enable, r.setting.c_str());
+    
+    if (r.setting.equalsIgnoreCase("schedule")) {
+      // Print days
+      Serial.print("    Days: ");
+      const char* dayNames[] = {"Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"};
+      for (int d = 0; d < 7; d++) {
+        if (r.weekday[d]) Serial.printf("%s ", dayNames[d]);
+      }
+      Serial.println();
+      Serial.printf("    ON: %02d:%02d, OFF: %02d:%02d\n", r.on_h, r.on_m, r.off_h, r.off_m);
+    } else if (r.setting.equalsIgnoreCase("timer")) {
+      Serial.printf("    ON Duration: %dh %dm %ds (total %lu sec)\n", r.on_h, r.on_m, r.on_s, r.on_duration_s);
+      Serial.printf("    OFF Duration: %dh %dm %ds (total %lu sec)\n", r.off_h, r.off_m, r.off_s, r.off_duration_s);
+      Serial.printf("    Current State: %s, Initialized: %d\n", r.timer_state ? "ON" : "OFF", r.initialized);
+    }
+  }
+  Serial.println("\n📋 === END ===\n");
+}
+
 // Read the entire schedule table from Supabase and print to Serial
 static void printScheduleTable() {
   if (WiFi.status() != WL_CONNECTED) {
@@ -778,6 +811,12 @@ static void printNextEvent() {
   int today = t.tm_wday;
   int nowMinutes = t.tm_hour * 60 + t.tm_min;
   unsigned long nowMs = millis();
+  
+  // Print today's date and day
+  Serial.printf("\n📅 === TODAY: %s, %04d-%02d-%02d %02d:%02d ===\n",
+                (const char*[]){"Sun","Mon","Tue","Wed","Thu","Fri","Sat"}[today],
+                t.tm_year + 1900, t.tm_mon + 1, t.tm_mday,
+                t.tm_hour, t.tm_min);
 
   time_t nextScheduleEvent = 0;
   time_t nextTimerEvent = 0;
@@ -801,70 +840,26 @@ static void printNextEvent() {
     // Determine if we're currently in this schedule window
     bool currentlyInWindow = false;
     
-    if (enabledDayCount == 1) {
-      int enabledDay = -1;
-      for (int d = 0; d < 7; d++) {
-        if (r.weekday[d]) { enabledDay = d; break; }
+    // If ON < OFF (same-day schedule), treat as daily repeating schedule regardless of enabled day count
+    // Only use multi-day span logic when ON > OFF (overnight schedule that spans multiple days)
+    if (onMinutes < offMinutes) {
+      // Same-day schedule: check if today is enabled and we're within the time window
+      if (r.weekday[today]) {
+        currentlyInWindow = (nowMinutes >= onMinutes && nowMinutes < offMinutes);
       }
-      if (today == enabledDay) {
-        if (onMinutes < offMinutes) {
-          currentlyInWindow = (nowMinutes >= onMinutes && nowMinutes < offMinutes);
-        } else if (onMinutes > offMinutes) {
+    } else if (onMinutes > offMinutes) {
+      // Overnight schedule: spans multiple days
+      if (enabledDayCount == 1) {
+        // Single day overnight schedule
+        int enabledDay = -1;
+        for (int d = 0; d < 7; d++) {
+          if (r.weekday[d]) { enabledDay = d; break; }
+        }
+        if (today == enabledDay) {
           currentlyInWindow = (nowMinutes >= onMinutes || nowMinutes < offMinutes);
         }
-      }
-    } else {
-      // Multi-day: find span
-      int spanStartDay = -1, spanEndDay = -1;
-      for (int offset = 0; offset < 7; offset++) {
-        int prevDay = (7 + offset - 1) % 7;
-        int curDay = offset;
-        if (!r.weekday[prevDay] && r.weekday[curDay]) {
-          spanStartDay = curDay;
-          break;
-        }
-      }
-      if (spanStartDay == -1) spanStartDay = 0;
-      for (int offset = 0; offset < 7; offset++) {
-        int curDay = (spanStartDay + offset) % 7;
-        int nextDay = (spanStartDay + offset + 1) % 7;
-        if (r.weekday[curDay] && !r.weekday[nextDay]) {
-          spanEndDay = curDay;
-          break;
-        }
-      }
-      if (spanEndDay == -1) spanEndDay = (spanStartDay + 6) % 7;
-
-      bool todayInSpan = r.weekday[today];
-      if (todayInSpan) {
-        bool isFirstDay = (today == spanStartDay);
-        bool isLastDay = (today == spanEndDay);
-        if (isLastDay) {
-          currentlyInWindow = (nowMinutes < offMinutes);
-        } else if (isFirstDay) {
-          currentlyInWindow = (nowMinutes >= onMinutes);
-        } else {
-          currentlyInWindow = true;  // Middle day
-        }
-      }
-    }
-
-    // Find next event for this schedule
-    time_t candidateEvent = 0;
-    char candidateDesc[64] = "";
-
-    if (currentlyInWindow) {
-      // Currently in window, next event is OFF
-      // OFF happens on the last day of span at offMinutes
-      struct tm boundaryTm = t;
-      boundaryTm.tm_hour = offMinutes / 60;
-      boundaryTm.tm_min = offMinutes % 60;
-      boundaryTm.tm_sec = 0;
-
-      if (enabledDayCount == 1) {
-        candidateEvent = mktime(&boundaryTm);
       } else {
-        // Multi-day: find last day
+        // Multi-day overnight schedule: find span
         int spanStartDay = -1, spanEndDay = -1;
         for (int offset = 0; offset < 7; offset++) {
           int prevDay = (7 + offset - 1) % 7;
@@ -885,43 +880,121 @@ static void printNextEvent() {
         }
         if (spanEndDay == -1) spanEndDay = (spanStartDay + 6) % 7;
 
-        int daysUntilEnd = (spanEndDay >= today) ? (spanEndDay - today) : (7 - today + spanEndDay);
-        boundaryTm = t;
-        boundaryTm.tm_mday += daysUntilEnd;
-        boundaryTm.tm_hour = offMinutes / 60;
-        boundaryTm.tm_min = offMinutes % 60;
-        boundaryTm.tm_sec = 0;
-        candidateEvent = mktime(&boundaryTm);
-      }
-      snprintf(candidateDesc, sizeof(candidateDesc), "Schedule OFF (%s)", r.setting);
-    } else {
-      // Not in window, next event is ON
-      // ON happens on the first day of span at onMinutes
-      // Find next occurrence of first day
-      int spanStartDay = -1;
-      for (int offset = 0; offset < 7; offset++) {
-        int prevDay = (7 + offset - 1) % 7;
-        int curDay = offset;
-        if (!r.weekday[prevDay] && r.weekday[curDay]) {
-          spanStartDay = curDay;
-          break;
+        bool todayInSpan = r.weekday[today];
+        if (todayInSpan) {
+          bool isFirstDay = (today == spanStartDay);
+          bool isLastDay = (today == spanEndDay);
+          if (isLastDay) {
+            currentlyInWindow = (nowMinutes < offMinutes);
+          } else if (isFirstDay) {
+            currentlyInWindow = (nowMinutes >= onMinutes);
+          } else {
+            currentlyInWindow = true;  // Middle day
+          }
         }
       }
-      if (spanStartDay == -1) spanStartDay = 0;
+    }
 
-      int daysUntilStart = (spanStartDay >= today) ? (spanStartDay - today) : (7 - today + spanStartDay);
-      
-      // If same day but time has passed, it's next week
-      if (daysUntilStart == 0 && nowMinutes >= onMinutes) {
-        daysUntilStart = 7;
-      }
+    // Find next event for this schedule
+    time_t candidateEvent = 0;
+    char candidateDesc[64] = "";
 
+    if (currentlyInWindow) {
+      // Currently in window, next event is OFF
       struct tm boundaryTm = t;
-      boundaryTm.tm_mday += daysUntilStart;
+      boundaryTm.tm_hour = offMinutes / 60;
+      boundaryTm.tm_min = offMinutes % 60;
+      boundaryTm.tm_sec = 0;
+
+      if (onMinutes < offMinutes) {
+        // Same-day schedule: OFF is today
+        candidateEvent = mktime(&boundaryTm);
+      } else {
+        // Overnight schedule: OFF might be today or later depending on span
+        if (enabledDayCount == 1) {
+          candidateEvent = mktime(&boundaryTm);
+        } else {
+          // Multi-day: find last day of span
+          int spanStartDay = -1, spanEndDay = -1;
+          for (int offset = 0; offset < 7; offset++) {
+            int prevDay = (7 + offset - 1) % 7;
+            int curDay = offset;
+            if (!r.weekday[prevDay] && r.weekday[curDay]) {
+              spanStartDay = curDay;
+              break;
+            }
+          }
+          if (spanStartDay == -1) spanStartDay = 0;
+          for (int offset = 0; offset < 7; offset++) {
+            int curDay = (spanStartDay + offset) % 7;
+            int nextDay = (spanStartDay + offset + 1) % 7;
+            if (r.weekday[curDay] && !r.weekday[nextDay]) {
+              spanEndDay = curDay;
+              break;
+            }
+          }
+          if (spanEndDay == -1) spanEndDay = (spanStartDay + 6) % 7;
+
+          int daysUntilEnd = (spanEndDay >= today) ? (spanEndDay - today) : (7 - today + spanEndDay);
+          boundaryTm = t;
+          boundaryTm.tm_mday += daysUntilEnd;
+          boundaryTm.tm_hour = offMinutes / 60;
+          boundaryTm.tm_min = offMinutes % 60;
+          boundaryTm.tm_sec = 0;
+          candidateEvent = mktime(&boundaryTm);
+        }
+      }
+      snprintf(candidateDesc, sizeof(candidateDesc), "Schedule OFF");
+    } else {
+      // Not in window, next event is ON
+      struct tm boundaryTm = t;
       boundaryTm.tm_hour = onMinutes / 60;
       boundaryTm.tm_min = onMinutes % 60;
       boundaryTm.tm_sec = 0;
-      candidateEvent = mktime(&boundaryTm);
+
+      if (onMinutes < offMinutes) {
+        // Same-day schedule: find next enabled day
+        // First check if today is enabled and time hasn't passed yet
+        if (r.weekday[today] && nowMinutes < onMinutes) {
+          candidateEvent = mktime(&boundaryTm);
+        } else {
+          // Find next enabled day
+          int daysToAdd = 0;
+          for (int d = 1; d <= 7; d++) {
+            int checkDay = (today + d) % 7;
+            if (r.weekday[checkDay]) {
+              daysToAdd = d;
+              break;
+            }
+          }
+          if (daysToAdd > 0) {
+            boundaryTm.tm_mday += daysToAdd;
+            candidateEvent = mktime(&boundaryTm);
+          }
+        }
+      } else {
+        // Overnight schedule: find next start day in span
+        int spanStartDay = -1;
+        for (int offset = 0; offset < 7; offset++) {
+          int prevDay = (7 + offset - 1) % 7;
+          int curDay = offset;
+          if (!r.weekday[prevDay] && r.weekday[curDay]) {
+            spanStartDay = curDay;
+            break;
+          }
+        }
+        if (spanStartDay == -1) spanStartDay = 0;
+
+        int daysUntilStart = (spanStartDay >= today) ? (spanStartDay - today) : (7 - today + spanStartDay);
+        
+        // If same day but time has passed, it's next week
+        if (daysUntilStart == 0 && nowMinutes >= onMinutes) {
+          daysUntilStart = 7;
+        }
+
+        boundaryTm.tm_mday += daysUntilStart;
+        candidateEvent = mktime(&boundaryTm);
+      }
       snprintf(candidateDesc, sizeof(candidateDesc), "Schedule ON");
     }
 
@@ -997,7 +1070,7 @@ static void printNextEvent() {
   if (nextScheduleEvent == 0 && nextTimerEvent == 0) {
     Serial.println("  No upcoming events");
   }
-  Serial.println("📅 === END ===\n");
+  Serial.println("📅 === END NEXT EVENTS ===\n");
 }
 
 // Evaluate and apply schedule; call every 1 minute
@@ -1011,6 +1084,12 @@ static void checkSchedule() {
 
   // Fetch all schedules for this device
   fetchSchedulesFromSupabase();
+  
+  // Debug: Print the schedule table from memory
+  printScheduleTableFromMemory();
+  
+  // Debug: Print the next events
+  printNextEvent();
   
   // If no schedules exist, maintain current relay state
   // Don't clear manual override - that state should persist
@@ -1078,86 +1157,82 @@ static void checkSchedule() {
       
       bool isInWindow = false;
       
-      if (enabledDayCount == 1) {
-        // Single day schedule: simple case
-        // Find the enabled day
-        int enabledDay = -1;
-        for (int d = 0; d < 7; ++d) {
-          if (r.weekday[d]) { enabledDay = d; break; }
+      // If ON < OFF (same-day schedule), treat as daily repeating schedule regardless of enabled day count
+      // Only use multi-day span logic when ON > OFF (overnight schedule that spans multiple days)
+      if (onMinutes < offMinutes) {
+        // Same-day schedule: check if today is enabled and we're within the time window
+        if (r.weekday[today]) {
+          if (nowMinutes >= onMinutes && nowMinutes < offMinutes) {
+            isInWindow = true;
+          }
         }
-        if (today == enabledDay) {
-          if (onMinutes < offMinutes) {
-            // Same day: ON in morning, OFF in evening
-            if (nowMinutes >= onMinutes && nowMinutes < offMinutes) {
-              isInWindow = true;
-            }
-          } else if (onMinutes > offMinutes) {
-            // Overnight within same enabled day (rare case)
+      } else if (onMinutes > offMinutes) {
+        // Overnight schedule: requires span logic
+        if (enabledDayCount == 1) {
+          // Single day overnight schedule
+          int enabledDay = -1;
+          for (int d = 0; d < 7; ++d) {
+            if (r.weekday[d]) { enabledDay = d; break; }
+          }
+          if (today == enabledDay) {
             if (nowMinutes >= onMinutes || nowMinutes < offMinutes) {
               isInWindow = true;
             }
           }
-        }
-      } else {
-        // Multi-day schedule: find contiguous span by looking for the first gap
-        // This properly handles week-wrapping schedules (e.g., Fri-Mon)
-        
-        // Find the start of the contiguous span (first enabled day after a gap)
-        int spanStartDay = -1;
-        int spanEndDay = -1;
-        
-        // Look for a gap (disabled day followed by enabled day) to find span start
-        for (int offset = 0; offset < 7; ++offset) {
-          int prevDay = (7 + offset - 1) % 7;
-          int curDay = offset;
-          if (!r.weekday[prevDay] && r.weekday[curDay]) {
-            spanStartDay = curDay;
-            break;
+        } else {
+          // Multi-day overnight schedule: find contiguous span
+          int spanStartDay = -1;
+          int spanEndDay = -1;
+          
+          // Look for a gap (disabled day followed by enabled day) to find span start
+          for (int offset = 0; offset < 7; ++offset) {
+            int prevDay = (7 + offset - 1) % 7;
+            int curDay = offset;
+            if (!r.weekday[prevDay] && r.weekday[curDay]) {
+              spanStartDay = curDay;
+              break;
+            }
           }
-        }
-        
-        // If no gap found (all 7 days enabled), span starts at day 0
-        if (spanStartDay == -1) spanStartDay = 0;
-        
-        // Find span end (last enabled day before a gap)
-        for (int offset = 0; offset < 7; ++offset) {
-          int curDay = (spanStartDay + offset) % 7;
-          int nextDay = (spanStartDay + offset + 1) % 7;
-          if (r.weekday[curDay] && !r.weekday[nextDay]) {
-            spanEndDay = curDay;
-            break;
+          
+          // If no gap found (all 7 days enabled), span starts at day 0
+          if (spanStartDay == -1) spanStartDay = 0;
+          
+          // Find span end (last enabled day before a gap)
+          for (int offset = 0; offset < 7; ++offset) {
+            int curDay = (spanStartDay + offset) % 7;
+            int nextDay = (spanStartDay + offset + 1) % 7;
+            if (r.weekday[curDay] && !r.weekday[nextDay]) {
+              spanEndDay = curDay;
+              break;
+            }
           }
-        }
-        
-        // If no gap found after start, all days are enabled
-        if (spanEndDay == -1) spanEndDay = (spanStartDay + 6) % 7;
-        
-        // Check if today is in the span
-        bool todayInSpan = r.weekday[today];
-        bool isFirstDay = (today == spanStartDay);
-        bool isLastDay = (today == spanEndDay);
-        bool isMiddleDay = todayInSpan && !isFirstDay && !isLastDay;
-        
-        if (todayInSpan) {
-          if (isMiddleDay) {
-            // Middle days are always ON (full 24 hours)
-            isInWindow = true;
-          } else if (isFirstDay && isLastDay) {
-            // Same day is both first and last (all 7 days enabled or single day)
-            if (onMinutes < offMinutes) {
-              if (nowMinutes >= onMinutes && nowMinutes < offMinutes) isInWindow = true;
-            } else {
+          
+          // If no gap found after start, all days are enabled
+          if (spanEndDay == -1) spanEndDay = (spanStartDay + 6) % 7;
+          
+          // Check if today is in the span
+          bool todayInSpan = r.weekday[today];
+          bool isFirstDay = (today == spanStartDay);
+          bool isLastDay = (today == spanEndDay);
+          bool isMiddleDay = todayInSpan && !isFirstDay && !isLastDay;
+          
+          if (todayInSpan) {
+            if (isMiddleDay) {
+              // Middle days are always ON (full 24 hours)
+              isInWindow = true;
+            } else if (isFirstDay && isLastDay) {
+              // Same day is both first and last (shouldn't happen with overnight schedule)
               if (nowMinutes >= onMinutes || nowMinutes < offMinutes) isInWindow = true;
-            }
-          } else if (isFirstDay) {
-            // First day: ON from onMinutes until midnight
-            if (nowMinutes >= onMinutes) {
-              isInWindow = true;
-            }
-          } else if (isLastDay) {
-            // Last day: ON from midnight until offMinutes
-            if (nowMinutes < offMinutes) {
-              isInWindow = true;
+            } else if (isFirstDay) {
+              // First day: ON from onMinutes until midnight
+              if (nowMinutes >= onMinutes) {
+                isInWindow = true;
+              }
+            } else if (isLastDay) {
+              // Last day: ON from midnight until offMinutes
+              if (nowMinutes < offMinutes) {
+                isInWindow = true;
+              }
             }
           }
         }
