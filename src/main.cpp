@@ -81,6 +81,43 @@ bool manualOverridePending = false; // whether manual override is still active
 time_t manualOverrideExpiryEpoch = 0; // epoch timestamp when override expires (0 = no schedule boundary, only timer can expire it)
 bool manualOverrideState = false; // the relay state set by manual override
 
+// === Data Usage Tracking (Supabase egress/ingress) ===
+unsigned long supabaseEgressBytes = 0;  // Data downloaded from Supabase (GET responses)
+unsigned long supabaseIngressBytes = 0; // Data uploaded to Supabase (POST payloads)
+unsigned long lastDataUsagePrintMs = 0;
+const unsigned long DATA_USAGE_PRINT_INTERVAL = 60000; // Print every 1 minute
+
+// Track and log data usage for an API call
+void trackDataUsage(const char *apiName, unsigned long requestBytes, unsigned long responseBytes) {
+  supabaseIngressBytes += requestBytes;
+  supabaseEgressBytes += responseBytes;
+  Serial.printf("[DATA] %s: ↑ %lu bytes (ingress), ↓ %lu bytes (egress)\n", apiName, requestBytes, responseBytes);
+}
+
+// Print cumulative data usage statistics
+void printDataUsageStats() {
+  unsigned long now = millis();
+  if (now - lastDataUsagePrintMs < DATA_USAGE_PRINT_INTERVAL) return;
+  lastDataUsagePrintMs = now;
+  
+  unsigned long totalBytes = supabaseEgressBytes + supabaseIngressBytes;
+  
+  Serial.println("\n📊 === SUPABASE DATA USAGE (1 minute) ===");
+  Serial.printf("Total Egress (⬇️ downloaded): %lu bytes (%.2f KB)\n", supabaseEgressBytes, supabaseEgressBytes / 1024.0);
+  Serial.printf("Total Ingress (⬆️ uploaded):   %lu bytes (%.2f KB)\n", supabaseIngressBytes, supabaseIngressBytes / 1024.0);
+  Serial.printf("Total Combined:                %lu bytes (%.2f KB)\n", totalBytes, totalBytes / 1024.0);
+  
+  // Extrapolate to daily usage for 3 devices
+  // bytes/min → KB/min (÷1024) → KB/day (×1440 min/day) → Total for 3 devices (×3)
+  float dailyUsageKB = (totalBytes / 1024.0) * 1440.0 * 3.0;
+  Serial.printf("Estimated Daily (3 devices):   %.2f KB/day (%.2f MB/day)\n", dailyUsageKB, dailyUsageKB / 1024.0);
+  Serial.println("📊 === END ===\n");
+  
+  // Reset counters for next minute
+  supabaseEgressBytes = 0;
+  supabaseIngressBytes = 0;
+}
+
 // === Fetch Relay Command ===
 bool fetchRelayCommand(const char *sensor_id, const char *target, bool currentState) {
   HTTPClient http;
@@ -92,6 +129,11 @@ bool fetchRelayCommand(const char *sensor_id, const char *target, bool currentSt
   int httpCode = http.GET();
   if (httpCode == 200) {
     String response = http.getString();
+    // Track egress (response from Supabase)
+    unsigned long requestSize = url.length() + 100; // Approximate request size (URL + headers)
+    unsigned long responseSize = response.length();
+    trackDataUsage("fetchRelayCommand", requestSize, responseSize);
+    
     int tsStart = response.indexOf("\"issued_at\":\"") + 13;
     int tsEnd = response.indexOf("\"", tsStart);
     if (tsStart > 12 && tsEnd > tsStart) {
@@ -133,8 +175,16 @@ void sendSensorData(String id, float t1, float t2, bool valid1, bool valid2, boo
 
   Serial.println("📤 POST: " + payload);
   int code = http.POST(payload);
-  if (code > 0) Serial.println("✅ Supabase: " + http.getString());
-  else Serial.println("❌ POST failed");
+  if (code > 0) {
+    String response = http.getString();
+    // Track ingress (payload sent) and egress (response received)
+    unsigned long payloadSize = payload.length();
+    unsigned long responseSize = response.length();
+    trackDataUsage("sendSensorData", payloadSize, responseSize);
+    Serial.println("✅ Supabase: " + response);
+  } else {
+    Serial.println("❌ POST failed");
+  }
 
   http.end();
 }
@@ -669,6 +719,12 @@ static void fetchSchedulesFromSupabase() {
     return;
   }
   String resp = http.getString();
+  
+  // Track egress (response from Supabase)
+  unsigned long requestSize = url.length() + 100; // Approximate request size
+  unsigned long responseSize = resp.length();
+  trackDataUsage("fetchSchedulesFromSupabase", requestSize, responseSize);
+  
   http.end();
 
   // Use ArduinoJson to parse the array of schedule rows
@@ -775,55 +831,6 @@ static void printScheduleTableFromMemory() {
 }
 
 // Read the entire schedule table from Supabase and print to Serial
-static void printScheduleTable() {
-  if (WiFi.status() != WL_CONNECTED) {
-    Serial.println("⚠️ printScheduleTable: WiFi not connected");
-    return;
-  }
-  HTTPClient http;
-  http.begin(getURLschedule);
-  http.addHeader("apikey", apikey);
-  http.addHeader("Authorization", "Bearer " + String(apikey));
-  int code = http.GET();
-  if (code == 200) {
-    String resp = http.getString();
-    // Minor formatting: put each object on its own line for readability
-    resp.replace("},{", "},\n{");
-    Serial.println("=== schedule table ===");
-    Serial.println(resp);
-    Serial.println("=== end schedule table ===");
-  } else {
-    Serial.printf("❌ printScheduleTable: HTTP GET failed, code=%d\n", code);
-    if (code > 0) Serial.println(http.getString());
-  }
-  http.end();
-}
-
-// Fetch and print only enabled schedules for this device (enable = true)
-static void printEnabledSchedules() {
-  if (WiFi.status() != WL_CONNECTED) {
-    Serial.println("⚠️ printEnabledSchedules: WiFi not connected");
-    return;
-  }
-  HTTPClient http;
-  String url = String(getURLschedule) + "?sensor_id=eq." + String(deviceId) + "&target=eq.relay1&enable=eq.true&order=id.asc";
-  http.begin(url);
-  http.addHeader("apikey", apikey);
-  http.addHeader("Authorization", "Bearer " + String(apikey));
-  int code = http.GET();
-  if (code == 200) {
-    String resp = http.getString();
-    // Minor formatting for readability
-    resp.replace("},{", "},\n{");
-    Serial.println("=== enabled schedules for device: " + String(deviceId) + " ===");
-    Serial.println(resp);
-    Serial.println("=== end enabled schedules ===");
-  } else {
-    Serial.printf("❌ printEnabledSchedules: HTTP GET failed, code=%d\n", code);
-    if (code > 0) Serial.println(http.getString());
-  }
-  http.end();
-}
 
 // Find and print next schedule/timer event
 static void printNextEvent() {
@@ -1395,7 +1402,7 @@ void setup() {
   ntpEverSynced = preferences.getBool("ntpSynced", false);
   preferences.end();
   
-  Serial.begin(115200);
+  Serial.begin(460800);
   delay(1000);
   Serial.printf("🔁 Relay restored from NVS: %s\n", relayState1 ? "ON" : "OFF");
   if (ntpEverSynced) {
@@ -1489,13 +1496,16 @@ void loop() {
     lastScheduleCheck = now;
     checkSchedule();
   }
+  
+  // Print data usage statistics every 1 minute
+  printDataUsageStats();
 
-  // Periodically dump the schedule table to Serial (non-blocking)
+  // Periodically dump the schedule table and next event to Serial (non-blocking)
+  // Uses in-memory cached schedules (no additional API calls)
   if (now - lastScheduleDump >= SCHEDULE_DUMP_INTERVAL_MS) {
     lastScheduleDump = now;
-    // printScheduleTable();
-    // printEnabledSchedules();
-    printNextEvent();  // Print next schedule/timer event
+    printScheduleTableFromMemory();  // Print from cached data (no API call)
+    printNextEvent();  // Print next schedule/timer event (no API call)
   }
 
   if (now - lastRelayCheck >= 5000) {
