@@ -9,11 +9,11 @@
 #include <ArduinoJson.h>
 #include <OneWire.h>
 #include <DallasTemperature.h>
-#include <EEPROM.h>
+#include <Preferences.h>
 
-// === EEPROM Setup ===
-#define EEPROM_SIZE 1
-#define EEPROM_RELAY_ADDR 0
+// === NVS (Non-Volatile Storage) Setup ===
+// Using Preferences API for better flash wear leveling than EEPROM
+Preferences preferences;
 
 // === Time sync configuration ===
 // Change these macros to adjust sync/retry behavior
@@ -66,14 +66,15 @@ bool relayState1 = false;
 unsigned long lastRelayCheck = 0;
 unsigned long lastSensorSend = 0;
 unsigned long lastWiFiCheck = 0;
-unsigned long lastEEPROMWrite = 0;
+unsigned long lastNVSWrite = 0;
 // lastScheduleCheck is used to run schedule checks every minute
 unsigned long lastScheduleCheck = 0;
 unsigned long lastScheduleDump = 0;
 // Whether schedule logic is allowed (requires valid NTP time)
 bool scheduleAllowed = false;
-// NTP time sync status
-bool ntpSyncFailed = true;  // Initially assume NTP sync hasn't succeeded yet
+// NTP time sync status - track if we've EVER successfully synced (not just current attempt)
+bool ntpEverSynced = false;  // Set to true once NTP sync succeeds at least once
+bool ntpCurrentlyFailing = false;  // True if recent sync attempts are failing
 unsigned long ntpLastRetryMs = 0;
 // Track manual override: when a manual command is issued, ignore schedule until next boundary
 bool manualOverridePending = false; // whether manual override is still active
@@ -277,26 +278,39 @@ public:
 
   // Call from loop() regularly; will trigger a sync when the interval elapsed.
   void update() {
-    // Check if NTP sync has just succeeded and update the global flag
-    if (lastSyncSuccess && ntpSyncFailed) {
-      ntpSyncFailed = false;
-      Serial.println("✅ NTP sync succeeded - enabling schedule engine");
+    // Check if NTP sync has just succeeded and update the global flags
+    if (lastSyncSuccess && !ntpEverSynced) {
+      ntpEverSynced = true;
+      ntpCurrentlyFailing = false;
+      // Save the fact that we've synced at least once to NVS
+      preferences.begin("esp32iot", false);
+      preferences.putBool("ntpSynced", true);
+      preferences.end();
+      Serial.println("✅ NTP sync succeeded - enabling schedule engine (persisted to NVS)");
     }
     
-    // If NTP sync has failed, use aggressive 10-second retry
-    unsigned long nowMs = millis();
-    unsigned long effectiveInterval = ntpSyncFailed ? 10000 : (lastSyncSuccess ? syncIntervalMs : retryIntervalMs);
+    // Update current failure status
+    if (lastSyncSuccess) {
+      ntpCurrentlyFailing = false;
+    }
     
-    if (lastSyncSuccess && !ntpSyncFailed) {
-      // Normal operation: periodic re-sync every 10 minutes
+    // If NTP has never been synced, use aggressive 10-second retry
+    // If already synced once, use normal intervals even if temporarily offline
+    unsigned long nowMs = millis();
+    unsigned long effectiveInterval = !ntpEverSynced ? 10000 : (lastSyncSuccess ? syncIntervalMs : retryIntervalMs);
+    
+    if (lastSyncSuccess && ntpEverSynced) {
+      // Normal operation: periodic re-sync every hour
       if ((nowMs - lastSyncMillis) >= effectiveInterval) {
-        trySync(TIME_SYNC_ATTEMPT_TIMEOUT_MS);
+        bool success = trySync(TIME_SYNC_ATTEMPT_TIMEOUT_MS);
+        if (!success) ntpCurrentlyFailing = true;
       }
     } else {
       // Initial sync or recovery: retry with appropriate interval
       if ((nowMs - ntpLastRetryMs) >= effectiveInterval) {
         ntpLastRetryMs = nowMs;
-        trySync(TIME_SYNC_ATTEMPT_TIMEOUT_MS);
+        bool success = trySync(TIME_SYNC_ATTEMPT_TIMEOUT_MS);
+        if (!success) ntpCurrentlyFailing = true;
       }
     }
   }
@@ -630,8 +644,16 @@ static void fetchSchedulesFromSupabase() {
   ScheduleRow prevRows[MAX_SCHEDULES];
   int prevCount = scheduleCount;
   for (int i = 0; i < prevCount && i < MAX_SCHEDULES; ++i) prevRows[i] = scheduleRows[i];
+  
+  // If WiFi is not connected, keep existing schedules (work offline with cached schedules)
+  if (WiFi.status() != WL_CONNECTED) {
+    if (scheduleCount > 0) {
+      Serial.println("📡 WiFi offline - using cached schedules");
+    }
+    return;
+  }
+  
   scheduleCount = 0;
-  if (WiFi.status() != WL_CONNECTED) return;
   HTTPClient http;
   String url = String(getURLschedule) + "?sensor_id=eq." + String(deviceId) + "&target=eq.relay1&order=id.asc";
   http.begin(url);
@@ -640,6 +662,10 @@ static void fetchSchedulesFromSupabase() {
   int code = http.GET();
   if (code != 200) {
     http.end();
+    // Restore previous schedules on fetch failure
+    scheduleCount = prevCount;
+    for (int i = 0; i < prevCount && i < MAX_SCHEDULES; ++i) scheduleRows[i] = prevRows[i];
+    Serial.printf("⚠️ Schedule fetch failed (HTTP %d) - using cached schedules\n", code);
     return;
   }
   String resp = http.getString();
@@ -651,6 +677,9 @@ static void fetchSchedulesFromSupabase() {
   DeserializationError err = deserializeJson(doc, resp);
   if (err) {
     Serial.printf("❌ fetchSchedulesFromSupabase: JSON parse failed: %s\n", err.c_str());
+    // Restore previous schedules on parse failure
+    scheduleCount = prevCount;
+    for (int i = 0; i < prevCount && i < MAX_SCHEDULES; ++i) scheduleRows[i] = prevRows[i];
     return;
   }
 
@@ -1077,12 +1106,13 @@ static void printNextEvent() {
 static void checkSchedule() {
   if (!scheduleAllowed) return;
   
-  // NTP time sync is mandatory - block schedule logic if NTP sync has failed
-  if (ntpSyncFailed) {
+  // NTP time sync is mandatory for initial operation
+  // Once synced, scheduler can work offline with local clock (even if NTP temporarily fails)
+  if (!ntpEverSynced) {
     return;
   }
 
-  // Fetch all schedules for this device
+  // Fetch all schedules for this device (works offline with cached schedules)
   fetchSchedulesFromSupabase();
   
   // Debug: Print the schedule table from memory
@@ -1349,17 +1379,28 @@ static void checkSchedule() {
 
 // === Setup ===
 void setup() {
-  EEPROM.begin(EEPROM_SIZE);
+  // Initialize NVS (Non-Volatile Storage) for persisting relay state and NTP sync status
+  preferences.begin("esp32iot", false);
+  
   delay(5);
   pinMode(ONE_WIRE_BUS_1, INPUT_PULLUP);
   pinMode(ONE_WIRE_BUS_2, INPUT_PULLUP);
   pinMode(RELAY1_PIN, OUTPUT);
 
-  relayState1 = EEPROM.read(EEPROM_RELAY_ADDR) == 1;
+  // Restore relay state from NVS
+  relayState1 = preferences.getBool("relayState", false);
   digitalWrite(RELAY1_PIN, relayState1 ? HIGH : LOW);
+  
+  // Restore NTP sync status from NVS (if we synced before, we can work offline)
+  ntpEverSynced = preferences.getBool("ntpSynced", false);
+  preferences.end();
+  
   Serial.begin(115200);
   delay(1000);
-  Serial.printf("🔁 Relay restored from EEPROM: %s\n", relayState1 ? "ON" : "OFF");
+  Serial.printf("🔁 Relay restored from NVS: %s\n", relayState1 ? "ON" : "OFF");
+  if (ntpEverSynced) {
+    Serial.println("✅ NTP was previously synced - scheduler can work offline");
+  }
 
   sensor1.begin();
   sensor2.begin();
@@ -1418,7 +1459,7 @@ void setup() {
   lastRelayCheck = millis();
   lastSensorSend = millis();
   lastWiFiCheck = millis();
-  lastEEPROMWrite = millis();
+  lastNVSWrite = millis();
 }
 
 // === Main Loop ===
@@ -1433,12 +1474,13 @@ void loop() {
   // Update TimeManager so it can perform hourly syncs (or keep local time running)
   timeManager.update();
 
-  // If schedule was disabled at boot, enable it automatically when NTP becomes available later
+  // If schedule was disabled at boot, enable it when NTP becomes available
+  // or if we've synced before (can work offline with local clock)
   if (!scheduleAllowed) {
     time_t maybe = timeManager.now();
-    if (maybe >= 1000000000) {
+    if (maybe >= 1000000000 || ntpEverSynced) {
       scheduleAllowed = true;
-      Serial.println("✅ NTP now available — enabling schedule engine");
+      Serial.println("✅ Schedule engine enabled (NTP available or previously synced)");
     }
   }
 
@@ -1613,14 +1655,15 @@ void loop() {
     lastSensorSend = now;
   }
 
-  if (now - lastEEPROMWrite >= 10000) {
-    lastEEPROMWrite = now;
-    uint8_t stored = EEPROM.read(EEPROM_RELAY_ADDR);
-    if (stored != (relayState1 ? 1 : 0)) {
-      EEPROM.write(EEPROM_RELAY_ADDR, relayState1 ? 1 : 0);
-      EEPROM.commit();
-      Serial.println("💾 Relay state saved to EEPROM.");
+  if (now - lastNVSWrite >= 10000) {
+    lastNVSWrite = now;
+    preferences.begin("esp32iot", false);
+    bool stored = preferences.getBool("relayState", false);
+    if (stored != relayState1) {
+      preferences.putBool("relayState", relayState1);
+      Serial.println("💾 Relay state saved to NVS.");
     }
+    preferences.end();
   }
 
   delay(10);
