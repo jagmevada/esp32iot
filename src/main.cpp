@@ -15,14 +15,6 @@
 #define EEPROM_SIZE 1
 #define EEPROM_RELAY_ADDR 0
 
-// === Data Usage Tracking ===
-unsigned long totalEgressBytes = 0;
-unsigned long totalIngressBytes = 0;
-int apiCallCount = 0;
-unsigned long lastEgressReport = 0;
-unsigned long bootCount = 0;
-unsigned long lastReportTime = 0;
-
 // === Time sync configuration ===
 // Change these macros to adjust sync/retry behavior
 #ifndef TIME_SYNC_INTERVAL_MS
@@ -80,6 +72,9 @@ unsigned long lastScheduleCheck = 0;
 unsigned long lastScheduleDump = 0;
 // Whether schedule logic is allowed (requires valid NTP time)
 bool scheduleAllowed = false;
+// NTP time sync status
+bool ntpSyncFailed = true;  // Initially assume NTP sync hasn't succeeded yet
+unsigned long ntpLastRetryMs = 0;
 // Track manual override: when a manual command is issued, ignore schedule until next boundary
 bool manualOverridePending = false; // whether manual override is still active
 time_t manualOverrideExpiryEpoch = 0; // epoch timestamp when override expires (0 = no schedule boundary, only timer can expire it)
@@ -96,11 +91,6 @@ bool fetchRelayCommand(const char *sensor_id, const char *target, bool currentSt
   int httpCode = http.GET();
   if (httpCode == 200) {
     String response = http.getString();
-    // Track data usage
-    totalEgressBytes += response.length();
-    totalIngressBytes += 300;  // Approximate request header size
-    apiCallCount++;
-    
     int tsStart = response.indexOf("\"issued_at\":\"") + 13;
     int tsEnd = response.indexOf("\"", tsStart);
     if (tsStart > 12 && tsEnd > tsStart) {
@@ -142,19 +132,11 @@ void sendSensorData(String id, float t1, float t2, bool valid1, bool valid2, boo
 
   Serial.println("📤 POST: " + payload);
   int code = http.POST(payload);
-  if (code > 0) {
-    String resp = http.getString();
-    // Track data usage
-    totalIngressBytes += payload.length();  // request body
-    totalEgressBytes += resp.length();       // response body
-    apiCallCount++;
-    Serial.println("✅ Supabase: " + resp);
-  }
+  if (code > 0) Serial.println("✅ Supabase: " + http.getString());
   else Serial.println("❌ POST failed");
 
   http.end();
 }
-
 
 // === Check WiFi and fallback to WiFiManager if failed ===
 void checkWiFi() {
@@ -295,14 +277,25 @@ public:
 
   // Call from loop() regularly; will trigger a sync when the interval elapsed.
   void update() {
+    // Check if NTP sync has just succeeded and update the global flag
+    if (lastSyncSuccess && ntpSyncFailed) {
+      ntpSyncFailed = false;
+      Serial.println("✅ NTP sync succeeded - enabling schedule engine");
+    }
+    
+    // If NTP sync has failed, use aggressive 10-second retry
     unsigned long nowMs = millis();
-    unsigned long effectiveInterval = lastSyncSuccess ? syncIntervalMs : retryIntervalMs;
-    if (lastSyncSuccess) {
+    unsigned long effectiveInterval = ntpSyncFailed ? 10000 : (lastSyncSuccess ? syncIntervalMs : retryIntervalMs);
+    
+    if (lastSyncSuccess && !ntpSyncFailed) {
+      // Normal operation: periodic re-sync every 10 minutes
       if ((nowMs - lastSyncMillis) >= effectiveInterval) {
         trySync(TIME_SYNC_ATTEMPT_TIMEOUT_MS);
       }
     } else {
-      if ((nowMs - lastAttemptMillis) >= effectiveInterval) {
+      // Initial sync or recovery: retry with appropriate interval
+      if ((nowMs - ntpLastRetryMs) >= effectiveInterval) {
+        ntpLastRetryMs = nowMs;
         trySync(TIME_SYNC_ATTEMPT_TIMEOUT_MS);
       }
     }
@@ -650,11 +643,6 @@ static void fetchSchedulesFromSupabase() {
     return;
   }
   String resp = http.getString();
-  // Track data usage
-  totalEgressBytes += resp.length();
-  totalIngressBytes += 300;  // Approximate request header size
-  apiCallCount++;
-  
   http.end();
 
   // Use ArduinoJson to parse the array of schedule rows
@@ -775,9 +763,251 @@ static void printEnabledSchedules() {
   http.end();
 }
 
+// Find and print next schedule/timer event
+static void printNextEvent() {
+  if (scheduleCount <= 0) {
+    Serial.println("ℹ️ No schedules or timers configured");
+    return;
+  }
+
+  time_t epoch = timeManager.now();
+  if (epoch <= 0) return;
+  time_t epochLocal = epoch + IST_OFFSET_SECONDS;
+  struct tm t;
+  gmtime_r(&epochLocal, &t);
+  int today = t.tm_wday;
+  int nowMinutes = t.tm_hour * 60 + t.tm_min;
+  unsigned long nowMs = millis();
+
+  time_t nextScheduleEvent = 0;
+  time_t nextTimerEvent = 0;
+  char scheduleDesc[128] = "";
+  char timerDesc[128] = "";
+
+  // Find next schedule event
+  for (int i = 0; i < scheduleCount; ++i) {
+    ScheduleRow &r = scheduleRows[i];
+    if (!r.enable || !r.setting.equalsIgnoreCase("schedule")) continue;
+
+    int enabledDayCount = 0;
+    for (int d = 0; d < 7; d++) {
+      if (r.weekday[d]) enabledDayCount++;
+    }
+    if (enabledDayCount == 0) continue;
+
+    int onMinutes = r.on_h * 60 + r.on_m;
+    int offMinutes = r.off_h * 60 + r.off_m;
+
+    // Determine if we're currently in this schedule window
+    bool currentlyInWindow = false;
+    
+    if (enabledDayCount == 1) {
+      int enabledDay = -1;
+      for (int d = 0; d < 7; d++) {
+        if (r.weekday[d]) { enabledDay = d; break; }
+      }
+      if (today == enabledDay) {
+        if (onMinutes < offMinutes) {
+          currentlyInWindow = (nowMinutes >= onMinutes && nowMinutes < offMinutes);
+        } else if (onMinutes > offMinutes) {
+          currentlyInWindow = (nowMinutes >= onMinutes || nowMinutes < offMinutes);
+        }
+      }
+    } else {
+      // Multi-day: find span
+      int spanStartDay = -1, spanEndDay = -1;
+      for (int offset = 0; offset < 7; offset++) {
+        int prevDay = (7 + offset - 1) % 7;
+        int curDay = offset;
+        if (!r.weekday[prevDay] && r.weekday[curDay]) {
+          spanStartDay = curDay;
+          break;
+        }
+      }
+      if (spanStartDay == -1) spanStartDay = 0;
+      for (int offset = 0; offset < 7; offset++) {
+        int curDay = (spanStartDay + offset) % 7;
+        int nextDay = (spanStartDay + offset + 1) % 7;
+        if (r.weekday[curDay] && !r.weekday[nextDay]) {
+          spanEndDay = curDay;
+          break;
+        }
+      }
+      if (spanEndDay == -1) spanEndDay = (spanStartDay + 6) % 7;
+
+      bool todayInSpan = r.weekday[today];
+      if (todayInSpan) {
+        bool isFirstDay = (today == spanStartDay);
+        bool isLastDay = (today == spanEndDay);
+        if (isLastDay) {
+          currentlyInWindow = (nowMinutes < offMinutes);
+        } else if (isFirstDay) {
+          currentlyInWindow = (nowMinutes >= onMinutes);
+        } else {
+          currentlyInWindow = true;  // Middle day
+        }
+      }
+    }
+
+    // Find next event for this schedule
+    time_t candidateEvent = 0;
+    char candidateDesc[64] = "";
+
+    if (currentlyInWindow) {
+      // Currently in window, next event is OFF
+      // OFF happens on the last day of span at offMinutes
+      struct tm boundaryTm = t;
+      boundaryTm.tm_hour = offMinutes / 60;
+      boundaryTm.tm_min = offMinutes % 60;
+      boundaryTm.tm_sec = 0;
+
+      if (enabledDayCount == 1) {
+        candidateEvent = mktime(&boundaryTm);
+      } else {
+        // Multi-day: find last day
+        int spanStartDay = -1, spanEndDay = -1;
+        for (int offset = 0; offset < 7; offset++) {
+          int prevDay = (7 + offset - 1) % 7;
+          int curDay = offset;
+          if (!r.weekday[prevDay] && r.weekday[curDay]) {
+            spanStartDay = curDay;
+            break;
+          }
+        }
+        if (spanStartDay == -1) spanStartDay = 0;
+        for (int offset = 0; offset < 7; offset++) {
+          int curDay = (spanStartDay + offset) % 7;
+          int nextDay = (spanStartDay + offset + 1) % 7;
+          if (r.weekday[curDay] && !r.weekday[nextDay]) {
+            spanEndDay = curDay;
+            break;
+          }
+        }
+        if (spanEndDay == -1) spanEndDay = (spanStartDay + 6) % 7;
+
+        int daysUntilEnd = (spanEndDay >= today) ? (spanEndDay - today) : (7 - today + spanEndDay);
+        boundaryTm = t;
+        boundaryTm.tm_mday += daysUntilEnd;
+        boundaryTm.tm_hour = offMinutes / 60;
+        boundaryTm.tm_min = offMinutes % 60;
+        boundaryTm.tm_sec = 0;
+        candidateEvent = mktime(&boundaryTm);
+      }
+      snprintf(candidateDesc, sizeof(candidateDesc), "Schedule OFF (%s)", r.setting);
+    } else {
+      // Not in window, next event is ON
+      // ON happens on the first day of span at onMinutes
+      // Find next occurrence of first day
+      int spanStartDay = -1;
+      for (int offset = 0; offset < 7; offset++) {
+        int prevDay = (7 + offset - 1) % 7;
+        int curDay = offset;
+        if (!r.weekday[prevDay] && r.weekday[curDay]) {
+          spanStartDay = curDay;
+          break;
+        }
+      }
+      if (spanStartDay == -1) spanStartDay = 0;
+
+      int daysUntilStart = (spanStartDay >= today) ? (spanStartDay - today) : (7 - today + spanStartDay);
+      
+      // If same day but time has passed, it's next week
+      if (daysUntilStart == 0 && nowMinutes >= onMinutes) {
+        daysUntilStart = 7;
+      }
+
+      struct tm boundaryTm = t;
+      boundaryTm.tm_mday += daysUntilStart;
+      boundaryTm.tm_hour = onMinutes / 60;
+      boundaryTm.tm_min = onMinutes % 60;
+      boundaryTm.tm_sec = 0;
+      candidateEvent = mktime(&boundaryTm);
+      snprintf(candidateDesc, sizeof(candidateDesc), "Schedule ON");
+    }
+
+    // Keep the earliest event
+    if (candidateEvent > 0) {
+      if (nextScheduleEvent == 0 || candidateEvent < nextScheduleEvent) {
+        nextScheduleEvent = candidateEvent;
+        snprintf(scheduleDesc, sizeof(scheduleDesc), "%s", candidateDesc);
+      }
+    }
+  }
+
+  // Find next timer event
+  for (int i = 0; i < scheduleCount; ++i) {
+    ScheduleRow &r = scheduleRows[i];
+    if (!r.enable || !r.setting.equalsIgnoreCase("timer")) continue;
+
+    if (!r.initialized) {
+      r.timer_state = true;
+      r.last_toggle_ms = nowMs;
+      r.initialized = true;
+    }
+
+    unsigned long elapsed = (nowMs - r.last_toggle_ms) / 1000UL;
+    unsigned long remainingSeconds = 0;
+
+    if (r.timer_state) {
+      if (r.on_duration_s > 0) {
+        if (elapsed >= r.on_duration_s) {
+          remainingSeconds = 0;  // Should toggle now
+        } else {
+          remainingSeconds = r.on_duration_s - elapsed;
+        }
+      }
+    } else {
+      if (r.off_duration_s > 0) {
+        if (elapsed >= r.off_duration_s) {
+          remainingSeconds = 0;  // Should toggle now
+        } else {
+          remainingSeconds = r.off_duration_s - elapsed;
+        }
+      }
+    }
+
+    if (remainingSeconds > 0) {
+      time_t timerEvent = epochLocal + remainingSeconds;
+      if (nextTimerEvent == 0 || timerEvent < nextTimerEvent) {
+        nextTimerEvent = timerEvent;
+        snprintf(timerDesc, sizeof(timerDesc), "Timer %s (in %lu sec)", r.timer_state ? "OFF" : "ON", remainingSeconds);
+      }
+    }
+  }
+
+  // Print next event
+  Serial.println("\n📅 === NEXT EVENTS ===");
+  
+  if (nextScheduleEvent > 0) {
+    struct tm eventTm;
+    gmtime_r(&nextScheduleEvent, &eventTm);
+    Serial.printf("  Schedule: %s at %s %02d:%02d\n", scheduleDesc,
+                  (const char*[]){"Sun","Mon","Tue","Wed","Thu","Fri","Sat"}[eventTm.tm_wday],
+                  eventTm.tm_hour, eventTm.tm_min);
+  }
+
+  if (nextTimerEvent > 0) {
+    struct tm eventTm;
+    gmtime_r(&nextTimerEvent, &eventTm);
+    Serial.printf("  Timer: %s at %s %02d:%02d\n", timerDesc,
+                  (const char*[]){"Sun","Mon","Tue","Wed","Thu","Fri","Sat"}[eventTm.tm_wday],
+                  eventTm.tm_hour, eventTm.tm_min);
+  }
+
+  if (nextScheduleEvent == 0 && nextTimerEvent == 0) {
+    Serial.println("  No upcoming events");
+  }
+  Serial.println("📅 === END ===\n");
+}
+
 // Evaluate and apply schedule; call every 1 minute
 static void checkSchedule() {
   if (!scheduleAllowed) return;
+  
+  // NTP time sync is mandatory - block schedule logic if NTP sync has failed
+  if (ntpSyncFailed) {
+    return;
+  }
 
   // Fetch all schedules for this device
   fetchSchedulesFromSupabase();
@@ -1137,8 +1367,8 @@ void loop() {
     }
   }
 
-  // Schedule check: run every 5 minutes (was 1 min, reduces egress ~200MB/month)
-  if (now - lastScheduleCheck >= 300000UL) {
+  // Schedule check: run every 1 minute
+  if (now - lastScheduleCheck >= 60000UL) {
     lastScheduleCheck = now;
     checkSchedule();
   }
@@ -1148,10 +1378,10 @@ void loop() {
     lastScheduleDump = now;
     // printScheduleTable();
     // printEnabledSchedules();
+    printNextEvent();  // Print next schedule/timer event
   }
 
-  // Relay command polling: every 30 seconds (was 5s, reduces egress ~50MB/month)
-  if (now - lastRelayCheck >= 30000) {
+  if (now - lastRelayCheck >= 5000) {
     lastRelayCheck = now;
     bool newState = fetchRelayCommand(deviceId, "relay1", relayState1);
     if (newState != relayState1) {
@@ -1295,8 +1525,7 @@ void loop() {
     }
   }
 
-  // Sensor data: every 2 minutes (was 40s, reduces egress ~6MB/month)
-  if (now - lastSensorSend >= 120000) {
+  if (now - lastSensorSend >= 40000) {
     float t1, t2;
     bool valid1, valid2;
     readSensors(t1, t2, valid1, valid2);
@@ -1317,23 +1546,6 @@ void loop() {
       EEPROM.commit();
       Serial.println("💾 Relay state saved to EEPROM.");
     }
-  }
-
-  // Hourly egress report
-  if (now - lastEgressReport >= 3600000UL) {  // 1 hour
-    lastEgressReport = now;
-    double kbPerCall = (apiCallCount > 0) ? (totalEgressBytes / 1024.0 / apiCallCount) : 0;
-    Serial.printf("\n📊 ========== EGRESS REPORT ==========\n");
-    Serial.printf("   Total Egress: %lu KB (%.2f MB)\n", totalEgressBytes / 1024, totalEgressBytes / 1024.0 / 1024.0);
-    Serial.printf("   Total Ingress: %lu KB (%.2f MB)\n", totalIngressBytes / 1024, totalIngressBytes / 1024.0 / 1024.0);
-    Serial.printf("   API Calls: %d\n", apiCallCount);
-    Serial.printf("   Avg per call: %.1f KB\n", kbPerCall);
-    Serial.printf("   Projected daily: %.2f MB/day\n", totalEgressBytes / 1024.0 / 1024.0 * 24);
-    Serial.printf("===================================\n\n");
-    // Reset counters
-    totalEgressBytes = 0;
-    totalIngressBytes = 0;
-    apiCallCount = 0;
   }
 
   delay(10);
