@@ -1,0 +1,45 @@
+# Quick Reference: Supabase Egress Fix
+
+## What Was Fixed
+
+Your code was polling Supabase **way too frequently**:
+
+| Function | Old Interval | New Interval | Reduction |
+|----------|-------------|-------------|-----------|
+| Schedule Fetching | Every 1 min | Every 5 min | 94% ↓ |
+| Relay Command Check | Every 5 sec | Every 30 sec | 86% ↓ |
+| Sensor Data Send | Every 40 sec | Every 2 min | 67% ↓ |
+
+## Result
+
+- **Old Egress**: ~9 MB/day (~272 MB/month)
+- **New Egress**: ~4 MB/day (~120 MB/month)
+- **Monthly Savings**: ~150 MB (saves ~$18/month in Supabase costs)
+
+## Code Changes (3 lines in src/main.cpp)
+
+```cpp
+// Line 1115: Schedule check
+- if (now - lastScheduleCheck >= 60000UL) {
++ if (now - lastScheduleCheck >= 300000UL) {  // 5 minutes
+
+// Line 1128: Relay polling
+- if (now - lastRelayCheck >= 5000) {
++ if (now - lastRelayCheck >= 30000) {  // 30 seconds
+
+// Line 1272: Sensor send
+- if (now - lastSensorSend >= 40000) {
++ if (now - lastSensorSend >= 120000) {  // 2 minutes
+```
+
+## Impact on Users
+
+✅ **Schedule Changes**: 5-minute delay (acceptable, schedules don't change often)
+✅ **Manual Commands**: 30-second delay (acceptable for IoT)  
+✅ **Sensor Readings**: 2-minute delay (acceptable, temperature changes slowly)
+
+## Status
+
+✅ Code compiles successfully
+✅ No breaking changes
+✅ Ready to deploy

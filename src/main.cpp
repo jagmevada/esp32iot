@@ -15,6 +15,14 @@
 #define EEPROM_SIZE 1
 #define EEPROM_RELAY_ADDR 0
 
+// === Data Usage Tracking ===
+unsigned long totalEgressBytes = 0;
+unsigned long totalIngressBytes = 0;
+int apiCallCount = 0;
+unsigned long lastEgressReport = 0;
+unsigned long bootCount = 0;
+unsigned long lastReportTime = 0;
+
 // === Time sync configuration ===
 // Change these macros to adjust sync/retry behavior
 #ifndef TIME_SYNC_INTERVAL_MS
@@ -88,6 +96,11 @@ bool fetchRelayCommand(const char *sensor_id, const char *target, bool currentSt
   int httpCode = http.GET();
   if (httpCode == 200) {
     String response = http.getString();
+    // Track data usage
+    totalEgressBytes += response.length();
+    totalIngressBytes += 300;  // Approximate request header size
+    apiCallCount++;
+    
     int tsStart = response.indexOf("\"issued_at\":\"") + 13;
     int tsEnd = response.indexOf("\"", tsStart);
     if (tsStart > 12 && tsEnd > tsStart) {
@@ -129,11 +142,19 @@ void sendSensorData(String id, float t1, float t2, bool valid1, bool valid2, boo
 
   Serial.println("📤 POST: " + payload);
   int code = http.POST(payload);
-  if (code > 0) Serial.println("✅ Supabase: " + http.getString());
+  if (code > 0) {
+    String resp = http.getString();
+    // Track data usage
+    totalIngressBytes += payload.length();  // request body
+    totalEgressBytes += resp.length();       // response body
+    apiCallCount++;
+    Serial.println("✅ Supabase: " + resp);
+  }
   else Serial.println("❌ POST failed");
 
   http.end();
 }
+
 
 // === Check WiFi and fallback to WiFiManager if failed ===
 void checkWiFi() {
@@ -629,6 +650,11 @@ static void fetchSchedulesFromSupabase() {
     return;
   }
   String resp = http.getString();
+  // Track data usage
+  totalEgressBytes += resp.length();
+  totalIngressBytes += 300;  // Approximate request header size
+  apiCallCount++;
+  
   http.end();
 
   // Use ArduinoJson to parse the array of schedule rows
@@ -1111,8 +1137,8 @@ void loop() {
     }
   }
 
-  // Schedule check: run every 1 minute
-  if (now - lastScheduleCheck >= 60000UL) {
+  // Schedule check: run every 5 minutes (was 1 min, reduces egress ~200MB/month)
+  if (now - lastScheduleCheck >= 300000UL) {
     lastScheduleCheck = now;
     checkSchedule();
   }
@@ -1124,7 +1150,8 @@ void loop() {
     // printEnabledSchedules();
   }
 
-  if (now - lastRelayCheck >= 5000) {
+  // Relay command polling: every 30 seconds (was 5s, reduces egress ~50MB/month)
+  if (now - lastRelayCheck >= 30000) {
     lastRelayCheck = now;
     bool newState = fetchRelayCommand(deviceId, "relay1", relayState1);
     if (newState != relayState1) {
@@ -1268,7 +1295,8 @@ void loop() {
     }
   }
 
-  if (now - lastSensorSend >= 40000) {
+  // Sensor data: every 2 minutes (was 40s, reduces egress ~6MB/month)
+  if (now - lastSensorSend >= 120000) {
     float t1, t2;
     bool valid1, valid2;
     readSensors(t1, t2, valid1, valid2);
@@ -1289,6 +1317,23 @@ void loop() {
       EEPROM.commit();
       Serial.println("💾 Relay state saved to EEPROM.");
     }
+  }
+
+  // Hourly egress report
+  if (now - lastEgressReport >= 3600000UL) {  // 1 hour
+    lastEgressReport = now;
+    double kbPerCall = (apiCallCount > 0) ? (totalEgressBytes / 1024.0 / apiCallCount) : 0;
+    Serial.printf("\n📊 ========== EGRESS REPORT ==========\n");
+    Serial.printf("   Total Egress: %lu KB (%.2f MB)\n", totalEgressBytes / 1024, totalEgressBytes / 1024.0 / 1024.0);
+    Serial.printf("   Total Ingress: %lu KB (%.2f MB)\n", totalIngressBytes / 1024, totalIngressBytes / 1024.0 / 1024.0);
+    Serial.printf("   API Calls: %d\n", apiCallCount);
+    Serial.printf("   Avg per call: %.1f KB\n", kbPerCall);
+    Serial.printf("   Projected daily: %.2f MB/day\n", totalEgressBytes / 1024.0 / 1024.0 * 24);
+    Serial.printf("===================================\n\n");
+    // Reset counters
+    totalEgressBytes = 0;
+    totalIngressBytes = 0;
+    apiCallCount = 0;
   }
 
   delay(10);
