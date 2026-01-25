@@ -72,8 +72,10 @@ unsigned long lastScheduleCheck = 0;
 unsigned long lastScheduleDump = 0;
 // Whether schedule logic is allowed (requires valid NTP time)
 bool scheduleAllowed = false;
-// When a schedule OFF event occurs we latch timers disabled until schedule ON or manual ON
-bool timersDisabledBySchedule = false;
+// Track manual override: when a manual command is issued, ignore schedule until next boundary
+bool manualOverridePending = false; // whether manual override is still active
+time_t manualOverrideExpiryEpoch = 0; // epoch timestamp when override expires (0 = no schedule boundary, only timer can expire it)
+bool manualOverrideState = false; // the relay state set by manual override
 
 // === Fetch Relay Command ===
 bool fetchRelayCommand(const char *sensor_id, const char *target, bool currentState) {
@@ -753,7 +755,13 @@ static void checkSchedule() {
 
   // Fetch all schedules for this device
   fetchSchedulesFromSupabase();
-  if (scheduleCount <= 0) return;
+  
+  // If no schedules exist, maintain current relay state
+  // Don't clear manual override - that state should persist
+  if (scheduleCount <= 0) {
+    Serial.println("ℹ️ No schedules/timers - maintaining current relay state");
+    return;
+  }
 
   time_t epoch = timeManager.now();
   if (epoch <= 0) return;
@@ -765,23 +773,147 @@ static void checkSchedule() {
   int today = t.tm_wday; // 0=Sun
   int cur_h = t.tm_hour;
   int cur_m = t.tm_min;
+  int nowMinutes = cur_h * 60 + cur_m;
 
-  bool anyOnTrigger = false;
-  bool anyOffTrigger = false;
-  int timerOnCount = 0;
+  // Check if manual override is still pending
+  // Manual override expires when we reach or pass the next schedule/timer boundary (epoch-based)
+  if (manualOverridePending && manualOverrideExpiryEpoch > 0) {
+    if (epochLocal >= manualOverrideExpiryEpoch) {
+      manualOverridePending = false;
+      struct tm expiryTm;
+      gmtime_r(&manualOverrideExpiryEpoch, &expiryTm);
+      Serial.printf("⏱ Manual override expired at schedule boundary (%s %02d:%02d): schedule control resumed\n", 
+                    (const char*[]){"Sun","Mon","Tue","Wed","Thu","Fri","Sat"}[expiryTm.tm_wday],
+                    expiryTm.tm_hour, expiryTm.tm_min);
+    }
+  }
+
+  // Note: Don't return early for manual override - we need to process timer state changes
+  // Timer state change will also clear the override (handled below)
 
   unsigned long nowMs = millis();
+
+  // Determine if schedule should be in ON or OFF state based on current time
+  // Multiple schedules are ORed: any schedule in ON window = effective schedule ON
+  bool scheduleShouldBeOn = false;
+  int scheduleCount_active = 0;
+
+  // Multiple timers are ORed: any timer ON = effective timer ON
+  bool timerShouldBeOn = false;
+  int timerCount_active = 0;
 
   for (int i = 0; i < scheduleCount; ++i) {
     ScheduleRow &r = scheduleRows[i];
     if (!r.enable) continue;     
     if (r.setting.equalsIgnoreCase("schedule")) {
-      if (!r.weekday[today]) continue;
-      if (cur_h == r.on_h && cur_m == r.on_m) anyOnTrigger = true;
-      if (cur_h == r.off_h && cur_m == r.off_m) anyOffTrigger = true;
+      // Multi-day schedule support:
+      // Find the contiguous span of enabled days
+      // For week-wrapping schedules (e.g., Fri-Mon), we need to find where the span starts/ends
+      
+      int enabledDayCount = 0;
+      for (int d = 0; d < 7; ++d) {
+        if (r.weekday[d]) enabledDayCount++;
+      }
+      
+      if (enabledDayCount == 0) continue; // No days enabled
+      
+      int onMinutes = r.on_h * 60 + r.on_m;
+      int offMinutes = r.off_h * 60 + r.off_m;
+      
+      bool isInWindow = false;
+      
+      if (enabledDayCount == 1) {
+        // Single day schedule: simple case
+        // Find the enabled day
+        int enabledDay = -1;
+        for (int d = 0; d < 7; ++d) {
+          if (r.weekday[d]) { enabledDay = d; break; }
+        }
+        if (today == enabledDay) {
+          if (onMinutes < offMinutes) {
+            // Same day: ON in morning, OFF in evening
+            if (nowMinutes >= onMinutes && nowMinutes < offMinutes) {
+              isInWindow = true;
+            }
+          } else if (onMinutes > offMinutes) {
+            // Overnight within same enabled day (rare case)
+            if (nowMinutes >= onMinutes || nowMinutes < offMinutes) {
+              isInWindow = true;
+            }
+          }
+        }
+      } else {
+        // Multi-day schedule: find contiguous span by looking for the first gap
+        // This properly handles week-wrapping schedules (e.g., Fri-Mon)
+        
+        // Find the start of the contiguous span (first enabled day after a gap)
+        int spanStartDay = -1;
+        int spanEndDay = -1;
+        
+        // Look for a gap (disabled day followed by enabled day) to find span start
+        for (int offset = 0; offset < 7; ++offset) {
+          int prevDay = (7 + offset - 1) % 7;
+          int curDay = offset;
+          if (!r.weekday[prevDay] && r.weekday[curDay]) {
+            spanStartDay = curDay;
+            break;
+          }
+        }
+        
+        // If no gap found (all 7 days enabled), span starts at day 0
+        if (spanStartDay == -1) spanStartDay = 0;
+        
+        // Find span end (last enabled day before a gap)
+        for (int offset = 0; offset < 7; ++offset) {
+          int curDay = (spanStartDay + offset) % 7;
+          int nextDay = (spanStartDay + offset + 1) % 7;
+          if (r.weekday[curDay] && !r.weekday[nextDay]) {
+            spanEndDay = curDay;
+            break;
+          }
+        }
+        
+        // If no gap found after start, all days are enabled
+        if (spanEndDay == -1) spanEndDay = (spanStartDay + 6) % 7;
+        
+        // Check if today is in the span
+        bool todayInSpan = r.weekday[today];
+        bool isFirstDay = (today == spanStartDay);
+        bool isLastDay = (today == spanEndDay);
+        bool isMiddleDay = todayInSpan && !isFirstDay && !isLastDay;
+        
+        if (todayInSpan) {
+          if (isMiddleDay) {
+            // Middle days are always ON (full 24 hours)
+            isInWindow = true;
+          } else if (isFirstDay && isLastDay) {
+            // Same day is both first and last (all 7 days enabled or single day)
+            if (onMinutes < offMinutes) {
+              if (nowMinutes >= onMinutes && nowMinutes < offMinutes) isInWindow = true;
+            } else {
+              if (nowMinutes >= onMinutes || nowMinutes < offMinutes) isInWindow = true;
+            }
+          } else if (isFirstDay) {
+            // First day: ON from onMinutes until midnight
+            if (nowMinutes >= onMinutes) {
+              isInWindow = true;
+            }
+          } else if (isLastDay) {
+            // Last day: ON from midnight until offMinutes
+            if (nowMinutes < offMinutes) {
+              isInWindow = true;
+            }
+          }
+        }
+      }
+      
+      // OR logic: any schedule in ON window makes effective schedule ON
+      if (isInWindow) {
+        scheduleShouldBeOn = true;
+        scheduleCount_active++;
+      }
     } else if (r.setting.equalsIgnoreCase("timer")) {
-      // If timers are disabled by a previous schedule OFF event, skip timer toggles
-      if (timersDisabledBySchedule) continue;
+      // Timers always run regardless of schedule state (for AND logic)
       // initialize timer state if needed
       if (!r.initialized) {
         r.timer_state = true;
@@ -789,60 +921,99 @@ static void checkSchedule() {
         r.initialized = true;
       }
       unsigned long elapsed = (nowMs - r.last_toggle_ms) / 1000UL;
+      bool timerStateChanged = false;
       if (r.timer_state) {
         if (r.on_duration_s > 0 && elapsed >= r.on_duration_s) {
           r.timer_state = false;
           r.last_toggle_ms = nowMs;
-          Serial.printf("⏱ Timer row %ld: relay1 OFF at %lu ms\n", r.row_id, nowMs);
+          timerStateChanged = true;
+          Serial.printf("⏱ Timer row %ld: timer OFF at %lu ms\n", r.row_id, nowMs);
         }
       } else {
         if (r.off_duration_s > 0 && elapsed >= r.off_duration_s) {
           r.timer_state = true;
           r.last_toggle_ms = nowMs;
-          Serial.printf("⏱ Timer row %ld: relay1 ON at %lu ms\n", r.row_id, nowMs);
+          timerStateChanged = true;
+          Serial.printf("⏱ Timer row %ld: timer ON at %lu ms\n", r.row_id, nowMs);
         }
       }
-      if (r.timer_state) timerOnCount++;
+      // If timer state changed and manual override was active, clear override
+      if (timerStateChanged && manualOverridePending) {
+        manualOverridePending = false;
+        manualOverrideExpiryEpoch = 0;
+        Serial.println("⏱ Manual override expired due to timer state change");
+      }
+      // OR logic: any timer ON makes effective timer ON
+      if (r.timer_state) {
+        timerShouldBeOn = true;
+        timerCount_active++;
+      }
     }
-     Serial.printf("[DEBUG] Row %d: setting=%s, timer_state=%d, initialized=%d, last_toggle_ms=%lu, on_duration_s=%lu, off_duration_s=%lu, weekday[today]=%d\n", i, r.setting.c_str(), r.timer_state, r.initialized, r.last_toggle_ms, r.on_duration_s, r.off_duration_s, r.weekday[today]);
+    Serial.printf("[DEBUG] Row %d: setting=%s, timer_state=%d, initialized=%d, last_toggle_ms=%lu, on_duration_s=%lu, off_duration_s=%lu\n", i, r.setting.c_str(), r.timer_state, r.initialized, r.last_toggle_ms, r.on_duration_s, r.off_duration_s);
   }
 
   bool desired = relayState1; // default: no change
-  int timerRowIndex = -1;
+  bool hasAnySchedule = false;
+  bool hasAnyTimer = false;
+  
+  // Count enabled schedules and timers
   for (int i = 0; i < scheduleCount; ++i) {
-    if (scheduleRows[i].enable && scheduleRows[i].setting.equalsIgnoreCase("timer")) {
-      timerRowIndex = i;
-      break;
+    if (scheduleRows[i].enable) {
+      if (scheduleRows[i].setting.equalsIgnoreCase("schedule")) {
+        hasAnySchedule = true;
+      } else if (scheduleRows[i].setting.equalsIgnoreCase("timer")) {
+        hasAnyTimer = true;
+      }
     }
-  }
-  // Event-driven behavior:
-  // - If any OFF trigger occurred now, latch timers disabled and force OFF
-  // - If any ON trigger occurred now, clear the latch and force ON
-  if (anyOffTrigger) {
-    timersDisabledBySchedule = true;
-    desired = false; // OFF takes precedence and latches timers disabled
-    Serial.println("⏱ Schedule OFF event: relay1 forced OFF and timers disabled");
-  } else if (anyOnTrigger) {
-    timersDisabledBySchedule = false;
-    desired = true;
-    Serial.println("⏱ Schedule ON event: relay1 forced ON and timers enabled");
-  } else {
-    // No schedule event this minute: timers only affect relay when not disabled
-    if (!timersDisabledBySchedule && timerRowIndex != -1) {
-      desired = scheduleRows[timerRowIndex].timer_state;
-      Serial.printf("⏱ Timer evaluation: timer_state=%d, relay1 desired state: %s\n", scheduleRows[timerRowIndex].timer_state, desired ? "ON" : "OFF");
-    }
-    // if timersDisabledBySchedule is true, timers have no effect until cleared by schedule ON or manual ON
   }
 
+  // Apply logic:
+  // - Multiple schedules: ORed together (scheduleShouldBeOn already computed with OR)
+  // - Multiple timers: ORed together (timerShouldBeOn already computed with OR)
+  // - Final: (Schedule1 OR Schedule2 OR ...) AND (Timer1 OR Timer2 OR ...)
+  
+  if (scheduleCount_active > 1) {
+    Serial.printf("ℹ️ %d schedule windows active (ORed together)\n", scheduleCount_active);
+  }
+  if (timerCount_active > 1) {
+    Serial.printf("ℹ️ %d timers ON (ORed together)\n", timerCount_active);
+  }
+  
+  if (hasAnySchedule && hasAnyTimer) {
+    // AND Logic: Relay = (Schedule1 OR Schedule2 OR ...) AND (Timer1 OR Timer2 OR ...)
+    desired = scheduleShouldBeOn && timerShouldBeOn;
+    Serial.printf("⏱ AND mode: EffectiveSchedule=%s, EffectiveTimer=%s => Relay=%s\n", 
+                  scheduleShouldBeOn ? "ON" : "OFF",
+                  timerShouldBeOn ? "ON" : "OFF",
+                  desired ? "ON" : "OFF");
+  } else if (hasAnySchedule) {
+    // Schedule-only mode: relay follows effective schedule (ORed)
+    desired = scheduleShouldBeOn;
+    Serial.printf("⏱ Schedule-only mode: relay=%s\n", desired ? "ON" : "OFF");
+  } else if (hasAnyTimer) {
+    // Timer-only mode: relay follows effective timer (ORed)
+    desired = timerShouldBeOn;
+    Serial.printf("⏱ Timer-only mode: relay=%s\n", desired ? "ON" : "OFF");
+  } else {
+    // No schedules or timers - maintain current state
+    Serial.println("ℹ️ No active schedules or timers - maintaining current relay state");
+  }
+
+  // If manual override is active, don't change relay state (keep manual state)
+  if (manualOverridePending) {
+    Serial.printf("⏱ Manual override active: keeping relay %s (auto would be %s)\n", 
+                  relayState1 ? "ON" : "OFF",
+                  desired ? "ON" : "OFF");
+    return;
+  }
+
+  // IMMEDIATE COMPLIANCE: Always update relay to match effective state
+  // Don't wait for transitions - if effective state differs from relay, change it now
   if (desired != relayState1) {
     relayState1 = desired;
     digitalWrite(RELAY1_PIN, relayState1 ? HIGH : LOW);
-    Serial.printf("🔁 Schedule engine set relay: %s\n", relayState1 ? "ON" : "OFF");    
+    Serial.printf("🔁 Relay updated to effective state: %s\n", relayState1 ? "ON" : "OFF");    
   }
-  // Print upcoming ON/OFF times after evaluating schedules
-  // printNextOnOffTimes();
-  // printNext24hSchedule();
 }
 
 // === Setup ===
@@ -957,31 +1128,133 @@ void loop() {
     lastRelayCheck = now;
     bool newState = fetchRelayCommand(deviceId, "relay1", relayState1);
     if (newState != relayState1) {
-      // Manual command detected. Apply manual reset rules for timers.
-      if (newState) {
-        // Manual ON: clear schedule-driven timer disable latch and reset timers to ON from now
-        timersDisabledBySchedule = false;
-        for (int i = 0; i < scheduleCount; ++i) {
-          ScheduleRow &r = scheduleRows[i];
-          if (!r.enable) continue;
-          if (r.setting.equalsIgnoreCase("timer")) {
-            r.timer_state = true;
-            r.last_toggle_ms = millis();
-            r.initialized = true;
+      // Manual command detected. Set override flag.
+      // Override expires on next automatic state change (timer toggle OR schedule boundary)
+      
+      if (scheduleCount > 0) {
+        // Find the next schedule boundary (for schedule-based expiry)
+        // Search up to 7 days ahead for multi-day schedule support
+        time_t epochUtc = timeManager.now();
+        time_t epochLocal = epochUtc + IST_OFFSET_SECONDS;
+        struct tm t;
+        gmtime_r(&epochLocal, &t);
+        int nowMinutes = t.tm_hour * 60 + t.tm_min;
+        
+        time_t nextBoundaryEpoch = 0; // 0 = no boundary found
+        
+        // Search up to 7 days ahead for the next schedule boundary
+        for (int dayOffset = 0; dayOffset < 7 && nextBoundaryEpoch == 0; dayOffset++) {
+          int checkDay = (t.tm_wday + dayOffset) % 7;
+          
+          for (int i = 0; i < scheduleCount; ++i) {
+            ScheduleRow &r = scheduleRows[i];
+            if (!r.enable || !r.setting.equalsIgnoreCase("schedule")) continue;
+            if (!r.weekday[checkDay]) continue;
+            
+            // Count enabled days
+            int enabledDayCount = 0;
+            for (int d = 0; d < 7; ++d) {
+              if (r.weekday[d]) enabledDayCount++;
+            }
+            if (enabledDayCount == 0) continue;
+            
+            int onMinutes = r.on_h * 60 + r.on_m;
+            int offMinutes = r.off_h * 60 + r.off_m;
+            
+            // Find span start and end (same logic as checkSchedule)
+            int spanStartDay = -1, spanEndDay = -1;
+            for (int offset = 0; offset < 7; ++offset) {
+              int prevDay = (7 + offset - 1) % 7;
+              int curDay = offset;
+              if (!r.weekday[prevDay] && r.weekday[curDay]) {
+                spanStartDay = curDay;
+                break;
+              }
+            }
+            if (spanStartDay == -1) spanStartDay = 0;
+            for (int offset = 0; offset < 7; ++offset) {
+              int curDay = (spanStartDay + offset) % 7;
+              int nextDay = (spanStartDay + offset + 1) % 7;
+              if (r.weekday[curDay] && !r.weekday[nextDay]) {
+                spanEndDay = curDay;
+                break;
+              }
+            }
+            if (spanEndDay == -1) spanEndDay = (spanStartDay + 6) % 7;
+            
+            bool isFirstDay = (checkDay == spanStartDay);
+            bool isLastDay = (checkDay == spanEndDay);
+            bool isSingleDay = (enabledDayCount == 1);
+            
+            // Candidate boundaries for this day
+            int candidateMinutes = -1;
+            
+            if (isSingleDay) {
+              // Single day schedule: both ON and OFF are boundaries
+              if (dayOffset == 0) {
+                // Today: find next boundary after now
+                if (onMinutes > nowMinutes) candidateMinutes = onMinutes;
+                else if (offMinutes > nowMinutes) candidateMinutes = offMinutes;
+              } else {
+                // Future day: earliest boundary
+                candidateMinutes = (onMinutes < offMinutes) ? onMinutes : offMinutes;
+              }
+            } else {
+              // Multi-day schedule
+              if (isFirstDay) {
+                // Only ON time is a boundary on first day
+                if (dayOffset == 0 && onMinutes > nowMinutes) candidateMinutes = onMinutes;
+                else if (dayOffset > 0) candidateMinutes = onMinutes;
+              }
+              if (isLastDay) {
+                // Only OFF time is a boundary on last day
+                if (dayOffset == 0 && offMinutes > nowMinutes) {
+                  if (candidateMinutes == -1 || offMinutes < candidateMinutes) candidateMinutes = offMinutes;
+                }
+                else if (dayOffset > 0) {
+                  if (candidateMinutes == -1 || offMinutes < candidateMinutes) candidateMinutes = offMinutes;
+                }
+              }
+            }
+            
+            if (candidateMinutes != -1) {
+              // Convert to epoch: current day's midnight + dayOffset days + candidateMinutes
+              struct tm boundaryTm = t;
+              boundaryTm.tm_hour = candidateMinutes / 60;
+              boundaryTm.tm_min = candidateMinutes % 60;
+              boundaryTm.tm_sec = 0;
+              time_t candidateEpoch = mktime(&boundaryTm) + (dayOffset * 86400);
+              
+              if (nextBoundaryEpoch == 0 || candidateEpoch < nextBoundaryEpoch) {
+                nextBoundaryEpoch = candidateEpoch;
+              }
+            }
           }
+        }
+        
+        // Set override - will expire on timer toggle or schedule boundary
+        manualOverridePending = true;
+        manualOverrideExpiryEpoch = nextBoundaryEpoch;
+        manualOverrideState = newState;
+        
+        if (nextBoundaryEpoch > 0) {
+          struct tm expiryTm;
+          gmtime_r(&nextBoundaryEpoch, &expiryTm);
+          Serial.printf("🔄 Manual command: override active until %s %02d:%02d\n", 
+                        (const char*[]){"Sun","Mon","Tue","Wed","Thu","Fri","Sat"}[expiryTm.tm_wday],
+                        expiryTm.tm_hour, expiryTm.tm_min);
+        } else {
+          Serial.println("🔄 Manual command: no schedule boundary found, override until timer toggle");
         }
       } else {
-        // Manual OFF: reset timers to OFF from now (but do NOT clear timersDisabledBySchedule)
-        for (int i = 0; i < scheduleCount; ++i) {
-          ScheduleRow &r = scheduleRows[i];
-          if (!r.enable) continue;
-          if (r.setting.equalsIgnoreCase("timer")) {
-            r.timer_state = false;
-            r.last_toggle_ms = millis();
-            r.initialized = true;
-          }
-        }
+        manualOverridePending = true;
+        manualOverrideExpiryEpoch = 0;
+        manualOverrideState = newState;
+        Serial.println("🔄 Manual command: no schedules, override until timer toggle");
       }
+
+      // DO NOT reset timers on manual command - let them continue cycling
+      // This ensures timer toggle can also expire the override
 
       relayState1 = newState;
       digitalWrite(RELAY1_PIN, relayState1 ? HIGH : LOW);
