@@ -38,7 +38,7 @@ Preferences preferences;
 #endif
 
 // Device identifier used to select schedules in Supabase
-const char *deviceId = "ac_1";
+const char *deviceId = "ac_2";
 
 // Maximum schedules to load
 #define MAX_SCHEDULES 8
@@ -1508,7 +1508,7 @@ void loop() {
     printNextEvent();  // Print next schedule/timer event (no API call)
   }
 
-  if (now - lastRelayCheck >= 5000) {
+  if (now - lastRelayCheck >= 20000) {
     lastRelayCheck = now;
     bool newState = fetchRelayCommand(deviceId, "relay1", relayState1);
     if (newState != relayState1) {
