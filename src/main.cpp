@@ -20,6 +20,15 @@
 //   http://13.200.74.140:9091/metrics/job/sensors/sensor_id/ecs_1
 const char *pushBaseURL = "http://13.200.74.140:9091/metrics/job/sensors/sensor_id/";
 
+// === WiFi ===
+// On boot the device tries this static network first; if it is not reachable
+// within STATIC_WIFI_TIMEOUT_MS, it opens the WiFiManager config portal (AP
+// named PORTAL_AP_NAME) so credentials can be entered from a web page.
+#define STATIC_SSID            "dada"
+#define STATIC_PASS            "dadaniruma"
+#define STATIC_WIFI_TIMEOUT_MS 15000
+#define PORTAL_AP_NAME         "TESTHARNESS_SETUP"
+
 // Start a new sweep every SEND_INTERVAL_MS. Within a sweep, push exactly one
 // device every DEVICE_GAP_MS (1/sec), so 6 devices take ~6s, then idle until
 // the next 15s mark.
@@ -116,27 +125,38 @@ void pushDummy(const TestDevice &d, float bias) {
   else                   pushDummyAC(d.id, bias);
 }
 
+// Try the static/default network first; if it is not available within
+// STATIC_WIFI_TIMEOUT_MS, open the WiFiManager config portal (web page).
+void connectWiFi() {
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(STATIC_SSID, STATIC_PASS);
+  Serial.printf("📶 Trying static SSID \"%s\"", STATIC_SSID);
+  unsigned long start = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - start < STATIC_WIFI_TIMEOUT_MS) {
+    delay(500);
+    Serial.print(".");
+  }
+
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.printf("\n✅ Connected to \"%s\", IP: %s\n", STATIC_SSID, WiFi.localIP().toString().c_str());
+    return;
+  }
+
+  Serial.printf("\n⚠️ \"%s\" not available — opening config portal (AP: %s)\n", STATIC_SSID, PORTAL_AP_NAME);
+  WiFiManager wm;
+  wm.setConfigPortalTimeout(120);
+  wm.setWiFiAutoReconnect(true);
+  if (!wm.autoConnect(PORTAL_AP_NAME)) {
+    Serial.println("❌ Portal timeout / failed. Restarting...");
+    ESP.restart();
+  }
+  Serial.printf("✅ Connected via portal, IP: %s\n", WiFi.localIP().toString().c_str());
+}
+
 void checkWiFi() {
   if (WiFi.status() != WL_CONNECTED) {
     Serial.println("⚠️ WiFi disconnected! Reconnecting...");
-    WiFi.disconnect();
-    WiFi.begin();
-    unsigned long start = millis();
-    while (WiFi.status() != WL_CONNECTED && millis() - start < 10000) {
-      delay(500);
-      Serial.print(".");
-    }
-    if (WiFi.status() != WL_CONNECTED) {
-      Serial.println("\n❌ Reconnect failed. Launching portal...");
-      WiFiManager wm;
-      wm.setConfigPortalTimeout(120);
-      if (!wm.autoConnect("TESTHARNESS_SETUP")) {
-        Serial.println("⏳ Portal timeout. Restarting...");
-        ESP.restart();
-      }
-    } else {
-      Serial.println("✅ Reconnected to WiFi");
-    }
+    connectWiFi();
   }
 }
 
@@ -145,14 +165,8 @@ void setup() {
   delay(200);
   Serial.println("\n=== Prometheus Pushgateway combined test harness ===");
 
-  WiFiManager wm;
-  wm.setConfigPortalTimeout(120);
-  wm.setWiFiAutoReconnect(true);
-  if (!wm.autoConnect("TESTHARNESS_SETUP")) {
-    Serial.println("❌ WiFiManager failed. Restarting...");
-    ESP.restart();
-  }
-  Serial.printf("✅ Connected. Pushing %u devices every %lus (1s gap each)\n",
+  connectWiFi();
+  Serial.printf("✅ Pushing %u devices every %lus (1s gap each)\n",
                 (unsigned)numDevices, (unsigned long)(SEND_INTERVAL_MS / 1000));
 
   lastSweep = millis() - SEND_INTERVAL_MS; // push immediately on first loop
