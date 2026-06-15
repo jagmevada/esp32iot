@@ -52,6 +52,24 @@ const char *getURLschedule = "https://nkkwdcsoijwcbgqrublg.supabase.co/rest/v1/s
 const char *postURL = "https://nkkwdcsoijwcbgqrublg.supabase.co/rest/v1/sensor_data";
 const char *apikey = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im5ra3dkY3NvaWp3Y2JncXJ1YmxnIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NjM0OTg2MDgsImV4cCI6MjA3OTA3NDYwOH0.z3P1a_zOvjm1EGAggj6JS5u0Eo091mUcZ0wXyfEge-w";
 
+// === Local Server (Prometheus Pushgateway) ===
+// Full push URL = pushBaseURL + device id, e.g.
+//   http://13.200.74.140:9091/metrics/job/sensors/sensor_id/ac_1
+const char *pushBaseURL = "http://13.200.74.140:9091/metrics/job/sensors/sensor_id/";
+
+// >>> GO LIVE: flip DUMMY_DATA from 1 to 0 to switch from the dummy test harness
+//     back to the real schedule/sensor firmware. Both paths push the SAME metric
+//     names (t1, t2, relay1) to the SAME URL, so the server interface is identical.
+#define DUMMY_DATA           1
+
+// Dummy push period (ms). 5s for real-time interface testing; raise for production.
+#define SEND_INTERVAL_MS     15000
+
+// AC devices only use t1, t2 and relay1 (no RH / PM / relay2). The test harness
+// pushes dummy data for ALL of these each cycle, with a 1s gap between devices.
+const char *testDevices[] = {"ac_1", "ac_2", "ac_3"};
+const size_t numTestDevices = sizeof(testDevices) / sizeof(testDevices[0]);
+
 // === GPIO Definitions ===
 #define ONE_WIRE_BUS_1 23
 #define ONE_WIRE_BUS_2 22
@@ -156,37 +174,62 @@ bool fetchRelayCommand(const char *sensor_id, const char *target, bool currentSt
   return currentState;
 }
 
-// === Send Sensor Data ===
+// === Prometheus Pushgateway helpers ===
+// Append one "name value" line in Prometheus text exposition format.
+static void addMetric(String &body, const char *name, const String &value) {
+  body += name;
+  body += ' ';
+  body += value;
+  body += '\n';
+}
+
+// POST a Prometheus text body to the Pushgateway for the given device id.
+bool pushToGateway(const String &id, const String &body) {
+  if (WiFi.status() != WL_CONNECTED) return false;
+
+  HTTPClient http;
+  String url = String(pushBaseURL) + id;
+  http.begin(url);
+  http.addHeader("Content-Type", "text/plain");
+
+  int code = http.POST(body);
+  Serial.println("📤 POST " + url);
+  Serial.print(body);
+  bool ok = (code == 200 || code == 202);
+  if (ok) {
+    Serial.println("✅ Pushgateway: POST success");
+  } else {
+    Serial.printf("❌ Pushgateway POST failed. Code: %d, Body: %s\n", code, http.getString().c_str());
+  }
+  http.end();
+  return ok;
+}
+
+// Hardcoded dummy push for AC devices (t1, t2, relay1 only) — interface testing.
+// Small jitter so the dashboard shows live movement.
+void sendDummyDataAC(const String &id) {
+  if (WiFi.status() != WL_CONNECTED) return;
+
+  String body;
+  addMetric(body, "t1", String(24.00 + random(-50, 50) / 100.0, 2));
+  addMetric(body, "t2", String(18.50 + random(-50, 50) / 100.0, 2));
+  addMetric(body, "relay1", relayState1 ? "1" : "0");
+
+  pushToGateway(id, body);
+}
+
+// === Send Sensor Data (real path, used when DUMMY_DATA == 0) ===
+// Pushes t1, t2, relay1 to the local Pushgateway. Invalid temps are omitted
+// (Prometheus text format has no "null").
 void sendSensorData(String id, float t1, float t2, bool valid1, bool valid2, bool relay1) {
   if (WiFi.status() != WL_CONNECTED) return;
 
-  HTTPClient http;
-  http.begin(postURL);
-  http.addHeader("Content-Type", "application/json");
-  http.addHeader("apikey", apikey);
-  http.addHeader("Authorization", "Bearer " + String(apikey));
+  String body;
+  if (valid1) addMetric(body, "t1", String(t1, 2));
+  if (valid2) addMetric(body, "t2", String(t2, 2));
+  addMetric(body, "relay1", relay1 ? "1" : "0");
 
-  String payload = "{";
-  payload += "\"sensor_id\":\"" + id + "\",";
-  if (valid1) payload += "\"t1\":" + String(t1, 2) + ",";
-  if (valid2) payload += "\"t2\":" + String(t2, 2) + ",";
-  payload += "\"relay1\":" + String(relay1 ? "true" : "false");
-  payload += "}";
-
-  Serial.println("📤 POST: " + payload);
-  int code = http.POST(payload);
-  if (code > 0) {
-    String response = http.getString();
-    // Track ingress (payload sent) and egress (response received)
-    unsigned long payloadSize = payload.length();
-    unsigned long responseSize = response.length();
-    trackDataUsage("sendSensorData", payloadSize, responseSize);
-    Serial.println("✅ Supabase: " + response);
-  } else {
-    Serial.println("❌ POST failed");
-  }
-
-  http.end();
+  pushToGateway(id, body);
 }
 
 // === Check WiFi and fallback to WiFiManager if failed ===
@@ -1459,9 +1502,11 @@ void setup() {
     }
   }
 
+#if !DUMMY_DATA
   relayState1 = fetchRelayCommand(deviceId, "relay1", relayState1);
   digitalWrite(RELAY1_PIN, relayState1 ? HIGH : LOW);
   Serial.printf("🔄 Relay updated from Supabase: %s\n", relayState1 ? "ON" : "OFF");
+#endif
 
   lastRelayCheck = millis();
   lastSensorSend = millis();
@@ -1472,6 +1517,26 @@ void setup() {
 // === Main Loop ===
 void loop() {
   unsigned long now = millis();
+
+#if DUMMY_DATA
+  // === TEST HARNESS: push dummy data for all AC devices to the local server ===
+  // Pushes t1, t2, relay1 for each id in testDevices[] with a 1s gap between
+  // devices. Short-circuits the production schedule/Supabase logic below.
+  // Flip DUMMY_DATA to 0 to restore the real firmware.
+  if (now - lastWiFiCheck > 10000) {
+    lastWiFiCheck = now;
+    checkWiFi();
+  }
+  if (now - lastSensorSend >= SEND_INTERVAL_MS) {
+    lastSensorSend = now;
+    for (size_t i = 0; i < numTestDevices; i++) {
+      sendDummyDataAC(testDevices[i]);
+      if (i < numTestDevices - 1) delay(1000); // 1s gap between devices
+    }
+  }
+  delay(10);
+  return;
+#endif
 
   if (now - lastWiFiCheck > 10000) {
     lastWiFiCheck = now;
