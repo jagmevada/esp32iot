@@ -206,6 +206,8 @@ bool pushToGateway(const String &id, const String &body) {
   HTTPClient http;
   String url = String(pushBaseURL) + id;
   http.begin(client, url);
+  http.setConnectTimeout(3000);
+  http.setTimeout(5000);
   http.addHeader("Content-Type", "text/plain");
 
   String creds = String(pgUser) + ":" + String(pgPass);
@@ -263,6 +265,8 @@ void fetchRelayCommands() {
   String url = String(relayCmdBaseURL) + deviceId + "/relays";
   Serial.println("🌐 Relay GET: " + url);
   http.begin(url);
+  http.setConnectTimeout(3000);
+  http.setTimeout(5000);
   http.addHeader("Authorization", "Basic " + base64::encode(String(pgUser) + ":" + String(pgPass)));
   int code = http.GET();
   if (code == 200) {
@@ -1533,6 +1537,7 @@ void setup() {
 
   connectWiFi();
 
+#if !RELAY_API_ONLY
   configTime(0, 0, "pool.ntp.org", "time.nist.gov");
   // Initialize TimeManager: it will attempt an immediate sync and then
   // keep local time running and sync every `TIME_SYNC_INTERVAL_MS`.
@@ -1568,6 +1573,7 @@ void setup() {
       scheduleAllowed = false;
     }
   }
+#endif  // !RELAY_API_ONLY
 
 #if RELAY_API_ONLY
   fetchRelayCommands();  // initial relay state from the new relay API
