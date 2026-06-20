@@ -12,6 +12,7 @@
 #include <Preferences.h>
 #include <WiFiClientSecure.h>
 #include <base64.h>
+#include "secrets.h"   // gitignored — copy include/secrets.example.h to include/secrets.h
 
 // === NVS (Non-Volatile Storage) Setup ===
 // Using Preferences API for better flash wear leveling than EEPROM
@@ -40,7 +41,7 @@ Preferences preferences;
 #endif
 
 // Device identifier used to select schedules in Supabase
-const char *deviceId = "ac_2";
+const char *deviceId = "ac_1";  // under test
 
 // Maximum schedules to load
 #define MAX_SCHEDULES 8
@@ -58,8 +59,24 @@ const char *apikey = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZ
 // Full push URL = pushBaseURL + device id, e.g.
 //   https://dhap-api.dbf.ooo/metrics/job/sensors/sensor_id/ac_1
 const char *pushBaseURL = "https://dhap-api.dbf.ooo/metrics/job/sensors/sensor_id/";
-const char *pgUser = "admin";
-const char *pgPass = "admin1";
+const char *pgUser = SECRET_PG_USER;
+const char *pgPass = SECRET_PG_PASS;
+
+// === Relay command API (plain HTTP, port 8000, Basic auth — same creds as push) ===
+// GET relayCmdBaseURL + deviceId + "/relays"  (polled every RELAY_POLL_MS).
+//   -> {"status":"success","sensor_id":"ac_1","relay1":0,"relay2":1}  (AC uses relay1 only)
+const char *relayCmdBaseURL = "http://13.200.74.140:8000/devices/"; // TEMP raw IP:port — to be replaced with domain name later
+#define RELAY_POLL_MS    20000
+#define SEND_INTERVAL_MS 30000
+
+// Relay-API-only mode: drive relay1 from the new API and bypass the Supabase
+// schedule/NTP/manual-override engine. Set to 0 to restore the schedule engine.
+#define RELAY_API_ONLY 1
+
+// TEMP (testing): try this static network before the WiFiManager portal.
+#define STATIC_SSID            SECRET_WIFI_SSID
+#define STATIC_PASS            SECRET_WIFI_PASS
+#define STATIC_WIFI_TIMEOUT_MS 15000
 
 // === GPIO Definitions ===
 #define ONE_WIRE_BUS_1 23
@@ -214,6 +231,76 @@ void sendSensorData(String id, float t1, float t2, bool valid1, bool valid2, boo
   addMetric(body, "relay1", relay1 ? "1" : "0");
 
   pushToGateway(id, body);
+}
+
+// Parse an integer 0/1 value for `key` from a small JSON body. Returns -1 if absent.
+static int parseRelayValue(const String &resp, const char *key) {
+  String needle = String("\"") + key + "\"";
+  int idx = resp.indexOf(needle);
+  if (idx < 0) return -1;
+  idx = resp.indexOf(':', idx);
+  if (idx < 0) return -1;
+  idx++;
+  while (idx < (int)resp.length() && (resp[idx] == ' ' || resp[idx] == '\t')) idx++;
+  if (idx >= (int)resp.length()) return -1;
+  if (resp[idx] == '1') return 1;
+  if (resp[idx] == '0') return 0;
+  return -1;
+}
+
+// Fetch relay1 command from the local server and apply it (Basic auth). AC has one relay.
+//   GET http://13.200.74.140:8000/devices/<deviceId>/relays
+//   -> {"status":"success","sensor_id":"ac_1","relay1":0,"relay2":1}
+void fetchRelayCommands() {
+  if (WiFi.status() != WL_CONNECTED) return;
+
+  HTTPClient http;
+  String url = String(relayCmdBaseURL) + deviceId + "/relays";
+  Serial.println("🌐 Relay GET: " + url);
+  http.begin(url);
+  http.addHeader("Authorization", "Basic " + base64::encode(String(pgUser) + ":" + String(pgPass)));
+  int code = http.GET();
+  if (code == 200) {
+    String resp = http.getString();
+    Serial.printf("✅ Relay GET 200: %s\n", resp.c_str());
+    int r1 = parseRelayValue(resp, "relay1");
+    if (r1 == 0 || r1 == 1) {
+      bool oldR1 = relayState1;
+      relayState1 = (r1 == 1);
+      digitalWrite(RELAY1_PIN, relayState1 ? HIGH : LOW);  // AC relay is active-HIGH
+      if (relayState1 != oldR1)
+        Serial.printf("🔄 Relay updated from server: relay1=%d\n", relayState1);
+    }
+  } else {
+    Serial.printf("❌ Relay GET failed. Code: %d\n", code);
+  }
+  http.end();
+}
+
+// Try the static/default network first; if unavailable, open the WiFiManager portal.
+void connectWiFi() {
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(STATIC_SSID, STATIC_PASS);
+  Serial.printf("📶 Trying static SSID \"%s\"", STATIC_SSID);
+  unsigned long start = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - start < STATIC_WIFI_TIMEOUT_MS) {
+    delay(500);
+    Serial.print(".");
+  }
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.printf("\n✅ Connected to \"%s\", IP: %s\n", STATIC_SSID, WiFi.localIP().toString().c_str());
+    return;
+  }
+
+  Serial.println("\n⚠️ Static SSID not available — opening config portal...");
+  WiFiManager wm;
+  wm.setConfigPortalTimeout(120);
+  wm.setWiFiAutoReconnect(true);
+  String setupName = String(deviceId) + "_SETUP";
+  if (!wm.autoConnect(setupName.c_str())) {
+    Serial.println("❌ WiFiManager failed. Restarting...");
+    ESP.restart();
+  }
 }
 
 // === Check WiFi and fallback to WiFiManager if failed ===
@@ -1439,17 +1526,8 @@ void setup() {
   sensor1.begin();
   sensor2.begin();
 
-  WiFiManager wm;
-  wm.setConfigPortalTimeout(120);
-  wm.setWiFiAutoReconnect(true);
-  String setupName = String(deviceId) + "_SETUP";
-  if (!wm.autoConnect(setupName.c_str())) {
-    Serial.println("⏳ WiFiManager timeout. Restarting...");
-    delay(1000);
-    ESP.restart();
-  }
+  connectWiFi();
 
-  Serial.println("✅ Connected via WiFiManager");
   configTime(0, 0, "pool.ntp.org", "time.nist.gov");
   // Initialize TimeManager: it will attempt an immediate sync and then
   // keep local time running and sync every `TIME_SYNC_INTERVAL_MS`.
@@ -1486,9 +1564,13 @@ void setup() {
     }
   }
 
+#if RELAY_API_ONLY
+  fetchRelayCommands();  // initial relay state from the new relay API
+#else
   relayState1 = fetchRelayCommand(deviceId, "relay1", relayState1);
   digitalWrite(RELAY1_PIN, relayState1 ? HIGH : LOW);
   Serial.printf("🔄 Relay updated from Supabase: %s\n", relayState1 ? "ON" : "OFF");
+#endif
 
   lastRelayCheck = millis();
   lastSensorSend = millis();
@@ -1504,6 +1586,34 @@ void loop() {
     lastWiFiCheck = now;
     checkWiFi();
   }
+
+#if RELAY_API_ONLY
+  // Relay-API mode: poll relay1 from the new API + push sensors; the Supabase
+  // schedule/command engine below is bypassed. Set RELAY_API_ONLY 0 to restore it.
+  if (now - lastRelayCheck >= RELAY_POLL_MS) {
+    lastRelayCheck = now;
+    fetchRelayCommands();
+  }
+  if (now - lastSensorSend >= SEND_INTERVAL_MS) {
+    lastSensorSend = now;
+    float t1, t2;
+    bool valid1, valid2;
+    readSensors(t1, t2, valid1, valid2);
+    sendSensorData(deviceId, t1, t2, valid1, valid2, relayState1);
+  }
+  if (now - lastNVSWrite >= 10000) {
+    lastNVSWrite = now;
+    preferences.begin("esp32iot", false);
+    bool stored = preferences.getBool("relayState", false);
+    if (stored != relayState1) {
+      preferences.putBool("relayState", relayState1);
+      Serial.println("💾 Relay state saved to NVS.");
+    }
+    preferences.end();
+  }
+  delay(10);
+  return;
+#endif
 
   // Update TimeManager so it can perform hourly syncs (or keep local time running)
   timeManager.update();
