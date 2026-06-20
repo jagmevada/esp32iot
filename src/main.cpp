@@ -286,30 +286,56 @@ void fetchRelayCommands() {
   http.end();
 }
 
-// Try the static/default network first; if unavailable, open the WiFiManager portal.
-void connectWiFi() {
-  WiFi.mode(WIFI_STA);
-  WiFi.begin(STATIC_SSID, STATIC_PASS);
-  Serial.printf("📶 Trying static SSID \"%s\"", STATIC_SSID);
+// Try one SSID/pass within STATIC_WIFI_TIMEOUT_MS. Returns true if connected.
+static bool tryWiFi(const char *ssid, const char *pass, const char *label) {
+  if (ssid == nullptr || strlen(ssid) == 0) return false;
+  Serial.printf("📶 Trying %s \"%s\"", label, ssid);
+  WiFi.begin(ssid, pass);
   unsigned long start = millis();
   while (WiFi.status() != WL_CONNECTED && millis() - start < STATIC_WIFI_TIMEOUT_MS) {
     delay(500);
     Serial.print(".");
   }
   if (WiFi.status() == WL_CONNECTED) {
-    Serial.printf("\n✅ Connected to \"%s\", IP: %s\n", STATIC_SSID, WiFi.localIP().toString().c_str());
-    return;
+    Serial.printf("\n✅ Connected to \"%s\", IP: %s\n", ssid, WiFi.localIP().toString().c_str());
+    return true;
+  }
+  Serial.printf("\n⚠️ Could not connect to \"%s\"\n", ssid);
+  return false;
+}
+
+// WiFi ladder: 1) static SSID from secrets.h (only if it's in range, so we never
+// clobber the saved network's creds), then WiFiManager autoConnect handles
+// 2) the previously-saved network and 3) the config portal.
+void connectWiFi() {
+  WiFi.mode(WIFI_STA);
+
+  // 1) Static / default network — attempt only if actually present in a scan.
+  Serial.printf("🔍 Scanning for static SSID \"%s\"...\n", STATIC_SSID);
+  int n = WiFi.scanNetworks();
+  bool staticPresent = false;
+  for (int i = 0; i < n; i++) {
+    if (WiFi.SSID(i) == STATIC_SSID) { staticPresent = true; break; }
+  }
+  WiFi.scanDelete();
+  if (staticPresent) {
+    if (tryWiFi(STATIC_SSID, STATIC_PASS, "static SSID")) return;
+  } else {
+    Serial.printf("ℹ️ Static SSID \"%s\" not in range.\n", STATIC_SSID);
   }
 
-  Serial.println("\n⚠️ Static SSID not available — opening config portal...");
+  // 2) saved network, then 3) config portal — WiFiManager stores/loads the
+  //    typed credentials reliably (incl. the password) in its own NVS.
+  Serial.println("📶 Trying saved network, else opening portal...");
   WiFiManager wm;
   wm.setConfigPortalTimeout(120);
   wm.setWiFiAutoReconnect(true);
   String setupName = String(deviceId) + "_SETUP";
   if (!wm.autoConnect(setupName.c_str())) {
-    Serial.println("❌ WiFiManager failed. Restarting...");
+    Serial.println("❌ Portal timeout. Restarting...");
     ESP.restart();
   }
+  Serial.printf("✅ WiFi connected: %s, IP: %s\n", WiFi.SSID().c_str(), WiFi.localIP().toString().c_str());
 }
 
 // === Check WiFi and fallback to WiFiManager if failed ===
