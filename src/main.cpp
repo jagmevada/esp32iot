@@ -65,9 +65,14 @@ const char *pgPass = SECRET_PG_PASS;
 // === Relay command API (plain HTTP, port 8000, Basic auth — same creds as push) ===
 // GET relayCmdBaseURL + deviceId + "/relays"  (polled every RELAY_POLL_MS).
 //   -> {"status":"success","sensor_id":"ac_1","relay1":0,"relay2":1}  (AC uses relay1 only)
-const char *relayCmdBaseURL = "http://13.200.74.140:8000/devices/"; // TEMP raw IP:port — to be replaced with domain name later
+const char *relayCmdBaseURL = "http://dhap-api.dbf.ooo:8000/devices/"; // TEMP: plain HTTP on :8000 (may move to HTTPS/standard port later)
 #define RELAY_POLL_MS    20000
 #define SEND_INTERVAL_MS 30000
+
+// Value pushed for a failed/disconnected temperature sensor, so the dashboard
+// shows an explicit failure marker instead of the last (stale) value.
+// 0 is never a real AC temperature, so it reads as an unambiguous fault.
+#define SENSOR_FAIL_VALUE 0
 
 // Relay-API-only mode: drive relay1 from the new API and bypass the Supabase
 // schedule/NTP/manual-override engine. Set to 0 to restore the schedule engine.
@@ -220,14 +225,14 @@ bool pushToGateway(const String &id, const String &body) {
 }
 
 // === Send Sensor Data (pushes t1, t2, relay1 to the Pushgateway) ===
-// Pushes t1, t2, relay1 to the local Pushgateway. Invalid temps are omitted
-// (Prometheus text format has no "null").
+// Always sends t1/t2; a failed/disconnected sensor sends SENSOR_FAIL_VALUE so the
+// dashboard shows an explicit failure marker instead of the last (stale) value.
 void sendSensorData(String id, float t1, float t2, bool valid1, bool valid2, bool relay1) {
   if (WiFi.status() != WL_CONNECTED) return;
 
   String body;
-  if (valid1) addMetric(body, "t1", String(t1, 2));
-  if (valid2) addMetric(body, "t2", String(t2, 2));
+  addMetric(body, "t1", valid1 ? String(t1, 2) : String(SENSOR_FAIL_VALUE));
+  addMetric(body, "t2", valid2 ? String(t2, 2) : String(SENSOR_FAIL_VALUE));
   addMetric(body, "relay1", relay1 ? "1" : "0");
 
   pushToGateway(id, body);
