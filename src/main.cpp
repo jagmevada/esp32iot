@@ -14,11 +14,13 @@
 #include <WiFiManager.h>
 #include <WiFi.h>
 #include <HTTPClient.h>
+#include <base64.h>
 
 // === Local Server (Prometheus Pushgateway) ===
 // Full push URL = pushBaseURL + device id, e.g.
 //   http://13.200.74.140:9091/metrics/job/sensors/sensor_id/ecs_1
-const char *pushBaseURL = "http://13.200.74.140:9091/metrics/job/sensors/sensor_id/";
+//https://dhap-api.dbf.ooo/#
+const char *pushBaseURL = "https://dhap-api.dbf.ooo/metrics/job/sensors/sensor_id/";
 
 // === WiFi ===
 // On boot the device tries this static network first; if it is not reachable
@@ -28,6 +30,10 @@ const char *pushBaseURL = "http://13.200.74.140:9091/metrics/job/sensors/sensor_
 #define STATIC_PASS            "dadaniruma"
 #define STATIC_WIFI_TIMEOUT_MS 15000
 #define PORTAL_AP_NAME         "TESTHARNESS_SETUP"
+
+// Basic auth credentials
+const char* pgUser = "admin";
+const char* pgPass = "admin1";
 
 // Start a new sweep every SEND_INTERVAL_MS. Within a sweep, push exactly one
 // device every DEVICE_GAP_MS (1/sec), so 6 devices take ~6s, then idle until
@@ -76,6 +82,11 @@ bool pushToGateway(const char *id, const String &body) {
   String url = String(pushBaseURL) + id;
   http.begin(url);
   http.addHeader("Content-Type", "text/plain");
+
+   // Build Basic Auth header: base64("user:pass")
+  String credentials = String(pgUser) + ":" + String(pgPass);
+  String encodedCreds = base64::encode(credentials);
+  http.addHeader("Authorization", "Basic " + encodedCreds);
 
   int code = http.POST(body);
   Serial.println("📤 POST " + url);
