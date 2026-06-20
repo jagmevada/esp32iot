@@ -10,6 +10,8 @@
 #include <OneWire.h>
 #include <DallasTemperature.h>
 #include <Preferences.h>
+#include <WiFiClientSecure.h>
+#include <base64.h>
 
 // === NVS (Non-Volatile Storage) Setup ===
 // Using Preferences API for better flash wear leveling than EEPROM
@@ -52,23 +54,12 @@ const char *getURLschedule = "https://nkkwdcsoijwcbgqrublg.supabase.co/rest/v1/s
 const char *postURL = "https://nkkwdcsoijwcbgqrublg.supabase.co/rest/v1/sensor_data";
 const char *apikey = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im5ra3dkY3NvaWp3Y2JncXJ1YmxnIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NjM0OTg2MDgsImV4cCI6MjA3OTA3NDYwOH0.z3P1a_zOvjm1EGAggj6JS5u0Eo091mUcZ0wXyfEge-w";
 
-// === Local Server (Prometheus Pushgateway) ===
+// === Local Server (Prometheus Pushgateway, HTTPS + Basic auth) ===
 // Full push URL = pushBaseURL + device id, e.g.
-//   http://13.200.74.140:9091/metrics/job/sensors/sensor_id/ac_1
-const char *pushBaseURL = "http://13.200.74.140:9091/metrics/job/sensors/sensor_id/";
-
-// >>> GO LIVE: flip DUMMY_DATA from 1 to 0 to switch from the dummy test harness
-//     back to the real schedule/sensor firmware. Both paths push the SAME metric
-//     names (t1, t2, relay1) to the SAME URL, so the server interface is identical.
-#define DUMMY_DATA           1
-
-// Dummy push period (ms). 5s for real-time interface testing; raise for production.
-#define SEND_INTERVAL_MS     15000
-
-// AC devices only use t1, t2 and relay1 (no RH / PM / relay2). The test harness
-// pushes dummy data for ALL of these each cycle, with a 1s gap between devices.
-const char *testDevices[] = {"ac_1", "ac_2", "ac_3"};
-const size_t numTestDevices = sizeof(testDevices) / sizeof(testDevices[0]);
+//   https://dhap-api.dbf.ooo/metrics/job/sensors/sensor_id/ac_1
+const char *pushBaseURL = "https://dhap-api.dbf.ooo/metrics/job/sensors/sensor_id/";
+const char *pgUser = "admin";
+const char *pgPass = "admin1";
 
 // === GPIO Definitions ===
 #define ONE_WIRE_BUS_1 23
@@ -187,10 +178,16 @@ static void addMetric(String &body, const char *name, const String &value) {
 bool pushToGateway(const String &id, const String &body) {
   if (WiFi.status() != WL_CONNECTED) return false;
 
+  WiFiClientSecure client;
+  client.setInsecure();                 // TLS without cert validation
+
   HTTPClient http;
   String url = String(pushBaseURL) + id;
-  http.begin(url);
+  http.begin(client, url);
   http.addHeader("Content-Type", "text/plain");
+
+  String creds = String(pgUser) + ":" + String(pgPass);
+  http.addHeader("Authorization", "Basic " + base64::encode(creds));
 
   int code = http.POST(body);
   Serial.println("📤 POST " + url);
@@ -205,20 +202,7 @@ bool pushToGateway(const String &id, const String &body) {
   return ok;
 }
 
-// Hardcoded dummy push for AC devices (t1, t2, relay1 only) — interface testing.
-// Small jitter so the dashboard shows live movement.
-void sendDummyDataAC(const String &id) {
-  if (WiFi.status() != WL_CONNECTED) return;
-
-  String body;
-  addMetric(body, "t1", String(24.00 + random(-50, 50) / 100.0, 2));
-  addMetric(body, "t2", String(18.50 + random(-50, 50) / 100.0, 2));
-  addMetric(body, "relay1", relayState1 ? "1" : "0");
-
-  pushToGateway(id, body);
-}
-
-// === Send Sensor Data (real path, used when DUMMY_DATA == 0) ===
+// === Send Sensor Data (pushes t1, t2, relay1 to the Pushgateway) ===
 // Pushes t1, t2, relay1 to the local Pushgateway. Invalid temps are omitted
 // (Prometheus text format has no "null").
 void sendSensorData(String id, float t1, float t2, bool valid1, bool valid2, bool relay1) {
@@ -1502,11 +1486,9 @@ void setup() {
     }
   }
 
-#if !DUMMY_DATA
   relayState1 = fetchRelayCommand(deviceId, "relay1", relayState1);
   digitalWrite(RELAY1_PIN, relayState1 ? HIGH : LOW);
   Serial.printf("🔄 Relay updated from Supabase: %s\n", relayState1 ? "ON" : "OFF");
-#endif
 
   lastRelayCheck = millis();
   lastSensorSend = millis();
@@ -1517,26 +1499,6 @@ void setup() {
 // === Main Loop ===
 void loop() {
   unsigned long now = millis();
-
-#if DUMMY_DATA
-  // === TEST HARNESS: push dummy data for all AC devices to the local server ===
-  // Pushes t1, t2, relay1 for each id in testDevices[] with a 1s gap between
-  // devices. Short-circuits the production schedule/Supabase logic below.
-  // Flip DUMMY_DATA to 0 to restore the real firmware.
-  if (now - lastWiFiCheck > 10000) {
-    lastWiFiCheck = now;
-    checkWiFi();
-  }
-  if (now - lastSensorSend >= SEND_INTERVAL_MS) {
-    lastSensorSend = now;
-    for (size_t i = 0; i < numTestDevices; i++) {
-      sendDummyDataAC(testDevices[i]);
-      if (i < numTestDevices - 1) delay(1000); // 1s gap between devices
-    }
-  }
-  delay(10);
-  return;
-#endif
 
   if (now - lastWiFiCheck > 10000) {
     lastWiFiCheck = now;
