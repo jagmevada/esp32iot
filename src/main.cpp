@@ -65,7 +65,7 @@ const char *pgPass = SECRET_PG_PASS;
 // === Relay command API (plain HTTP, port 8000, Basic auth — same creds as push) ===
 // GET relayCmdBaseURL + deviceId + "/relays"  (polled every RELAY_POLL_MS).
 //   -> {"status":"success","sensor_id":"ac_1","relay1":0,"relay2":1}  (AC uses relay1 only)
-const char *relayCmdBaseURL = "http://dhap-api.dbf.ooo:8000/devices/"; // TEMP: plain HTTP on :8000 (may move to HTTPS/standard port later)
+const char *relayCmdBaseURL = "https://dhap-api.dbf.ooo:8002/devices/"; // TEMP: plain HTTP on :8000 (may move to HTTPS/standard port later)
 #define RELAY_POLL_MS    20000
 #define SEND_INTERVAL_MS 30000
 
